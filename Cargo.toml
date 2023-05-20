@@ -1,0 +1,10 @@
+[package]
+name = "libflatview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = "0.26"
+thiserror = "1.0"
+lazy_static = "1.4"
+#itertools = "0.10"
