@@ -1,18 +1,22 @@
+mod cache;
+
+use cache::Cache;
 use lazy_static::lazy_static;
-use nix::{libc::off_t, sys::mman::ProtFlags, unistd::Whence};
+use nix::{libc::off_t, sys::mman::ProtFlags};
 use std::{
     ffi::c_void,
     fs,
     io::ErrorKind,
     num::NonZeroUsize,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::MetadataExt,
     },
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
-/// Limits the maximum map size in bytes to 1/256 of pointer size.
+/// Limits the maximum map size, in bytes, to 1/256 of pointer size.
 const MAX_MAP_SIZE: u64 = 1 << (usize::BITS - 8);
 /// Limits the maximum mapped size in bytes to 1/8 of pointer size.
 const MAX_TOTAL_MAPPED: u64 = 1 << (usize::BITS - 3);
@@ -51,11 +55,14 @@ pub enum Mode {
     /// smaller than expected, error `Error::WrongSize` is returned.
     ReadOnly,
     /// Files are opened and mapped in read and write mode. If they don't exist
-    /// or are smaller than then expected, they are created and extended to the
+    /// or are smaller than expected, they are created and extended to the
     /// expected size.
     ///
     /// If `reserve` is set, all non-allocated blocks on sparse files will be
-    /// allocated.
+    /// allocated. This is recommended, because if the application tries to
+    /// write to an unallocated block, but it can't be allocated because the
+    /// storage is full, your application will be signaled with SIGBUS on POSIX,
+    /// and God knows what happens on Windows.
     ///
     /// If `truncate` is set, files larger than what they are supposed to be are
     /// truncated.
@@ -65,8 +72,17 @@ pub enum Mode {
 /// A sequence of files with known sizes grouped together as a single
 /// 64-bit addressable byte array.
 pub struct FileGroup {
-    // The path and size of of every file.
+    /// Cache shared among other `FileGroup` storing actual file mappings. It
+    /// has to be shared if we want to control the amount of resources used
+    /// globally by the all the file groups sharing it.
+    cache: Arc<Cache>,
+
+    /// The path and size of of every file.
     paths_and_sizes: Vec<(PathBuf, u64)>,
+
+    /// The cumulative sizes of the files, in ascending order matching
+    /// `paths_and_sizes`.
+    cumulative_sizes: Vec<u64>,
 }
 
 impl FileGroup {
@@ -78,6 +94,7 @@ impl FileGroup {
     /// If `strict_size` is set, error `Error::WrongSize` if there are files
     /// larger than the expected.
     pub fn new(
+        shared_cache: Arc<Cache>,
         files_with_sizes: &[(&Path, u64)],
         operation_mode: Mode,
         strict_size: bool,
@@ -88,8 +105,8 @@ impl FileGroup {
             false
         };
 
-        // For every file that exists, either truncate to the right size, or error.
-        let mut missing_files = Vec::new();
+        // For every file expected to exist, either truncate to the right size,
+        // or error.
         for (path, required_size) in files_with_sizes {
             match fs::metadata(path) {
                 Ok(metadata) => {
@@ -127,17 +144,14 @@ impl FileGroup {
                     if is_read_only || err.kind() != ErrorKind::NotFound {
                         return Err(err.into());
                     }
-                    missing_files.push((*path, *required_size));
+
+                    // Create missing file and directory.
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    nix::unistd::truncate(*path, (*required_size).try_into().unwrap())?;
                 }
             }
-        }
-
-        // Create all missing files.
-        for (path, required_size) in missing_files {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            nix::unistd::truncate(path, required_size.try_into().unwrap())?;
         }
 
         // Canonicalize all paths.
@@ -155,41 +169,26 @@ impl FileGroup {
             if reserve {
                 for (path, size) in paths_and_sizes.iter() {
                     let fd = file_open(path, FileMode::ReadWrite)?;
-
-                    let mut curr_data = 0;
-                    let mut curr_hole;
-                    while {
-                        curr_hole =
-                            nix::unistd::lseek(fd.as_raw_fd(), curr_data, Whence::SeekHole)?;
-                        (curr_hole as u64) < *size
-                    } {
-                        let hole_end =
-                            nix::unistd::lseek(fd.as_raw_fd(), curr_hole, Whence::SeekData)?;
-
-                        while curr_hole < hole_end {
-                            let map_size = std::cmp::max(hole_end - curr_hole, MAX_MAP_SIZE as i64);
-
-                            let map = MMap::from_fd(
-                                fd.as_fd(),
-                                FileMode::ReadWrite,
-                                curr_hole,
-                                NonZeroUsize::new(map_size.try_into().unwrap()).unwrap(),
-                            )?;
-
-                            map.get_mut().unwrap().fill(0);
-
-                            curr_hole += map_size;
-                        }
-
-                        curr_data = hole_end;
-                    }
+                    nix::fcntl::posix_fallocate(fd.as_raw_fd(), 0, *size as i64)?;
                 }
             }
         }
 
-        // TODO: to be continued...
+        // Calculate matching vector of cumulative sizes.
+        let cumulative_sizes: Vec<u64> = paths_and_sizes
+            .iter()
+            .scan(0u64, |curr, (_, len)| {
+                let val = *curr;
+                *curr += *len;
+                Some(val)
+            })
+            .collect();
 
-        Ok(FileGroup { paths_and_sizes })
+        Ok(FileGroup {
+            cache: shared_cache,
+            paths_and_sizes,
+            cumulative_sizes,
+        })
     }
 }
 
