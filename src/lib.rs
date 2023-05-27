@@ -6,6 +6,7 @@ use nix::{libc::off_t, sys::mman::ProtFlags};
 use std::{
     ffi::c_void,
     fs::{self, OpenOptions},
+    io::{self, ErrorKind},
     num::NonZeroUsize,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -35,6 +36,10 @@ pub enum Error {
     IOError(#[from] std::io::Error),
     #[error("file have unexpected size")]
     WrongSize,
+    #[error("not a regular file")]
+    NotAFile,
+    #[error("path component is not a directory")]
+    NotADirectory,
 }
 
 impl From<nix::errno::Errno> for Error {
@@ -100,44 +105,64 @@ impl FileGroup {
             false
         };
 
-        // For every file expected to exist, either truncate to the right size,
-        // or error.
-        //
-        // TODO: maybe just check in this first loop, and then make
-        // modifications in a next one. This way, there is much less chance of
-        // the user's filesystem being modified in case of errors, and only race
-        // conditions and disk full might trigger errors after changes have been
-        // made.
+        // Sanity check every path without modifying the filesystem, to
+        // trigger an error in cases we can before writing anything.
         for (path, required_size) in files_with_sizes {
-            let file = OpenOptions::new()
+            // We actually try to open the file instead of just retrieving
+            // metadata, because in unixes it seems this is the only reliable
+            // way to know if a file is writable.
+            let open_result = OpenOptions::new()
                 .read(true)
                 .write(!is_read_only)
-                .create(!is_read_only)
-                .open(path)?;
+                .open(path);
 
-            let metadata = file.metadata()?;
-            match &operation_mode {
-                Mode::ReadOnly => {
-                    if metadata.size() < *required_size
-                        || (strict_size && metadata.size() > *required_size)
+            match open_result {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    if !metadata.is_file() {
+                        return Err(Error::NotAFile);
+                    }
+                    if (strict_size && metadata.size() > *required_size)
+                        || (is_read_only && metadata.size() < *required_size)
                     {
                         return Err(Error::WrongSize);
                     }
                 }
-                Mode::ReadWrite { reserve, truncate } => {
-                    if metadata.size() > *required_size {
-                        if *truncate {
-                            file.set_len(*required_size)?;
-                        } else if strict_size {
-                            return Err(Error::WrongSize);
-                        }
-                    } else if metadata.size() < *required_size {
-                        file.set_len(*required_size)?;
+                Err(err) => {
+                    if is_read_only || err.kind() != ErrorKind::NotFound {
+                        return Err(err.into());
                     }
 
-                    if *reserve {
-                        nix::fcntl::posix_fallocate(file.as_raw_fd(), 0, *required_size as i64)?;
-                    }
+                    has_writable_first_existing_ancestor(path.parent().ok_or(err)?)?;
+                }
+            }
+        }
+
+        // Create and truncate every file if in writing mode. In read only mode
+        // all files have already been checked, and we are all good.
+        if let Mode::ReadWrite { reserve, truncate } = operation_mode {
+            for (path, required_size) in files_with_sizes {
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(path)?;
+
+                let metadata = file.metadata()?;
+
+                if (metadata.size() < *required_size)
+                    || (truncate && metadata.size() > *required_size)
+                {
+                    file.set_len(*required_size)?;
+                }
+
+                if reserve {
+                    // TODO: make this platform independent
+                    nix::fcntl::posix_fallocate(file.as_raw_fd(), 0, *required_size as i64)?;
                 }
             }
         }
@@ -195,6 +220,47 @@ impl<T> PtrType<T> {
     }
 }
 
+/// Try its best to decide if the first existing ancestor of a path is a
+/// writable directory.
+///
+/// Returns error if an existing part of the path is not a directory, if the
+/// last existing directory is not writable.
+fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
+    let mut last_err: io::Error = ErrorKind::NotFound.into();
+    for ancestor in path.ancestors() {
+        let ancestor = if !ancestor.as_os_str().is_empty() {
+            ancestor
+        } else {
+            &Path::new(".")
+        };
+
+        match fs::metadata(ancestor) {
+            Ok(metadata) => {
+                // First existing path section found. Fail if is a dir or not
+                // writable, otherwise succeed.
+                return if !metadata.is_dir() {
+                    Err(Error::NotADirectory)
+                } else if !metadata.permissions().readonly() {
+                    // TODO: try to test for permissions more reliably, possibly
+                    // using platform specific calls.
+                    Err(Error::IOError(ErrorKind::PermissionDenied.into()))
+                } else {
+                    Ok(())
+                };
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+                last_err = err;
+            }
+        }
+    }
+
+    // Could not find any directory in the path (how???).
+    Err(Error::IOError(last_err))
+}
+
 struct MMap {
     ptr: PtrType<u8>,
     len: NonZeroUsize,
@@ -248,4 +314,10 @@ impl Drop for MMap {
             nix::sys::mman::munmap(self.ptr.const_ptr() as *mut c_void, self.len.into()).unwrap();
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn empty() {}
 }
