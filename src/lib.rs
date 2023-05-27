@@ -5,21 +5,18 @@ use lazy_static::lazy_static;
 use nix::{libc::off_t, sys::mman::ProtFlags};
 use std::{
     ffi::c_void,
-    fs,
-    io::ErrorKind,
+    fs::{self, OpenOptions},
     num::NonZeroUsize,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
         unix::prelude::MetadataExt,
     },
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 /// Limits the maximum map size, in bytes, to 1/256 of pointer size.
 const MAX_MAP_SIZE: u64 = 1 << (usize::BITS - 8);
-/// Limits the maximum mapped size in bytes to 1/8 of pointer size.
-const MAX_TOTAL_MAPPED: u64 = 1 << (usize::BITS - 3);
 
 lazy_static! {
     /// The page size.
@@ -38,8 +35,6 @@ pub enum Error {
     IOError(#[from] std::io::Error),
     #[error("file have unexpected size")]
     WrongSize,
-    #[error("path is a regular file")]
-    NotAFile,
 }
 
 impl From<nix::errno::Errno> for Error {
@@ -107,49 +102,42 @@ impl FileGroup {
 
         // For every file expected to exist, either truncate to the right size,
         // or error.
+        //
+        // TODO: maybe just check in this first loop, and then make
+        // modifications in a next one. This way, there is much less chance of
+        // the user's filesystem being modified in case of errors, and only race
+        // conditions and disk full might trigger errors after changes have been
+        // made.
         for (path, required_size) in files_with_sizes {
-            match fs::metadata(path) {
-                Ok(metadata) => {
-                    if !metadata.is_file() {
-                        return Err(Error::NotAFile);
-                    }
-                    match &operation_mode {
-                        Mode::ReadOnly => {
-                            if metadata.size() < *required_size
-                                || (strict_size && metadata.size() > *required_size)
-                            {
-                                return Err(Error::WrongSize);
-                            }
-                        }
-                        Mode::ReadWrite {
-                            reserve: _,
-                            truncate,
-                        } => {
-                            if metadata.size() > *required_size {
-                                if *truncate {
-                                    nix::unistd::truncate(
-                                        *path,
-                                        (*required_size).try_into().unwrap(),
-                                    )?;
-                                } else if strict_size {
-                                    return Err(Error::WrongSize);
-                                }
-                            } else if metadata.size() < *required_size {
-                                nix::unistd::truncate(*path, (*required_size).try_into().unwrap())?;
-                            }
-                        }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(!is_read_only)
+                .create(!is_read_only)
+                .open(path)?;
+
+            let metadata = file.metadata()?;
+            match &operation_mode {
+                Mode::ReadOnly => {
+                    if metadata.size() < *required_size
+                        || (strict_size && metadata.size() > *required_size)
+                    {
+                        return Err(Error::WrongSize);
                     }
                 }
-                Err(err) => {
-                    if is_read_only || err.kind() != ErrorKind::NotFound {
-                        return Err(err.into());
+                Mode::ReadWrite { reserve, truncate } => {
+                    if metadata.size() > *required_size {
+                        if *truncate {
+                            file.set_len(*required_size)?;
+                        } else if strict_size {
+                            return Err(Error::WrongSize);
+                        }
+                    } else if metadata.size() < *required_size {
+                        file.set_len(*required_size)?;
                     }
 
-                    // Create missing file and directory.
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
+                    if *reserve {
+                        nix::fcntl::posix_fallocate(file.as_raw_fd(), 0, *required_size as i64)?;
                     }
-                    nix::unistd::truncate(*path, (*required_size).try_into().unwrap())?;
                 }
             }
         }
@@ -159,20 +147,6 @@ impl FileGroup {
             .iter()
             .map(|(path, size)| fs::canonicalize(path).map(|path| (path, *size)))
             .collect::<Result<Vec<_>, _>>()?;
-
-        // Fill holes.
-        if let Mode::ReadWrite {
-            reserve,
-            truncate: _,
-        } = operation_mode
-        {
-            if reserve {
-                for (path, size) in paths_and_sizes.iter() {
-                    let fd = file_open(path, FileMode::ReadWrite)?;
-                    nix::fcntl::posix_fallocate(fd.as_raw_fd(), 0, *size as i64)?;
-                }
-            }
-        }
 
         // Calculate matching vector of cumulative sizes.
         let cumulative_sizes: Vec<u64> = paths_and_sizes
