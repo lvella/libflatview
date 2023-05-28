@@ -1,34 +1,16 @@
-mod cache;
+pub mod cache;
+mod platform;
 
 use cache::Cache;
-use lazy_static::lazy_static;
-use nix::{libc::off_t, sys::mman::ProtFlags};
+use platform::preallocate_file;
 use std::{
-    ffi::c_void,
     fs::{self, OpenOptions},
     io::{self, ErrorKind},
-    num::NonZeroUsize,
-    os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-        unix::prelude::MetadataExt,
-    },
+    ops::{Range, RangeBounds},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-/// Limits the maximum map size, in bytes, to 1/256 of pointer size.
-const MAX_MAP_SIZE: u64 = 1 << (usize::BITS - 8);
-
-lazy_static! {
-    /// The page size.
-    static ref PAGESIZE: u64 = {
-        let page = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as u64;
-        // I don't really expect the page size to be bigger than 1/256 of
-        // pointer size, but just in case:
-        assert!(page < MAX_MAP_SIZE);
-        page
-    };
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -40,12 +22,10 @@ pub enum Error {
     NotAFile,
     #[error("path component is not a directory")]
     NotADirectory,
-}
-
-impl From<nix::errno::Errno> for Error {
-    fn from(value: nix::errno::Errno) -> Self {
-        Error::IOError(std::io::Error::from_raw_os_error(value as i32))
-    }
+    #[error("a write write was attempted on read-only mode")]
+    ReadOnlyMode,
+    #[error("the range requested is invalid")]
+    InvalidRange,
 }
 
 /// The operation mode of a `FileGroup`.
@@ -77,12 +57,20 @@ pub struct FileGroup {
     /// globally by the all the file groups sharing it.
     cache: Arc<Cache>,
 
-    /// The path and size of of every file.
+    /// Tells if this is in read-only mode.
+    is_read_only: bool,
+
+    /// The path and size of of every file whose requested size was greater than
+    /// zero.
     paths_and_sizes: Vec<(PathBuf, u64)>,
 
     /// The cumulative sizes of the files, in ascending order matching
-    /// `paths_and_sizes`.
+    /// `paths_and_sizes`. Since there are no zero-sized files, all entries are
+    /// distinct, and this vector is strictly crescent.
     cumulative_sizes: Vec<u64>,
+
+    /// The total size of the mapping.
+    total_size: u64,
 }
 
 impl FileGroup {
@@ -95,7 +83,7 @@ impl FileGroup {
     /// larger than the expected.
     pub fn new(
         shared_cache: Arc<Cache>,
-        files_with_sizes: &[(&Path, u64)],
+        files_with_sizes: &[(impl AsRef<Path>, u64)],
         operation_mode: Mode,
         strict_size: bool,
     ) -> Result<FileGroup, Error> {
@@ -108,6 +96,7 @@ impl FileGroup {
         // Sanity check every path without modifying the filesystem, to
         // trigger an error in cases we can before writing anything.
         for (path, required_size) in files_with_sizes {
+            let path = path.as_ref();
             // We actually try to open the file instead of just retrieving
             // metadata, because in unixes it seems this is the only reliable
             // way to know if a file is writable.
@@ -122,8 +111,8 @@ impl FileGroup {
                     if !metadata.is_file() {
                         return Err(Error::NotAFile);
                     }
-                    if (strict_size && metadata.size() > *required_size)
-                        || (is_read_only && metadata.size() < *required_size)
+                    if (strict_size && metadata.len() > *required_size)
+                        || (is_read_only && metadata.len() < *required_size)
                     {
                         return Err(Error::WrongSize);
                     }
@@ -142,6 +131,7 @@ impl FileGroup {
         // all files have already been checked, and we are all good.
         if let Mode::ReadWrite { reserve, truncate } = operation_mode {
             for (path, required_size) in files_with_sizes {
+                let path = path.as_ref();
                 if let Some(dir) = path.parent() {
                     fs::create_dir_all(dir)?;
                 }
@@ -154,70 +144,93 @@ impl FileGroup {
 
                 let metadata = file.metadata()?;
 
-                if (metadata.size() < *required_size)
-                    || (truncate && metadata.size() > *required_size)
+                if (metadata.len() < *required_size)
+                    || (truncate && metadata.len() > *required_size)
                 {
                     file.set_len(*required_size)?;
                 }
 
                 if reserve {
-                    // TODO: make this platform independent
-                    nix::fcntl::posix_fallocate(file.as_raw_fd(), 0, *required_size as i64)?;
+                    preallocate_file(file.as_raw_fd(), *required_size)?;
                 }
             }
         }
 
-        // Canonicalize all paths.
+        // Remove zero sized files, because they are never mapped and only
+        // complicates stuff, and canonicalize all paths so they are independent
+        // of current workdir.
         let paths_and_sizes = files_with_sizes
             .iter()
-            .map(|(path, size)| fs::canonicalize(path).map(|path| (path, *size)))
+            .filter_map(|(path, size)| {
+                if *size == 0 {
+                    None
+                } else {
+                    Some(fs::canonicalize(path).map(|path| (path, *size)))
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         // Calculate matching vector of cumulative sizes.
+        let mut total_size = 0u64;
         let cumulative_sizes: Vec<u64> = paths_and_sizes
             .iter()
-            .scan(0u64, |curr, (_, len)| {
-                let val = *curr;
-                *curr += *len;
-                Some(val)
+            .map(|(_, len)| {
+                let val = total_size;
+                total_size += *len;
+                val
             })
             .collect();
 
         Ok(FileGroup {
             cache: shared_cache,
+            is_read_only,
             paths_and_sizes,
             cumulative_sizes,
+            total_size,
         })
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileMode {
-    ReadOnly,
-    ReadWrite,
-}
+    pub fn get(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
+        // Sanitize range bounds:
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(x) => *x,
+            std::ops::Bound::Excluded(x) => *x + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(x) => *x + 1,
+            std::ops::Bound::Excluded(x) => *x,
+            std::ops::Bound::Unbounded => self.total_size,
+        };
 
-fn file_open(path: &Path, mode: FileMode) -> nix::Result<OwnedFd> {
-    let oflag = match mode {
-        FileMode::ReadOnly => nix::fcntl::OFlag::O_RDONLY,
-        FileMode::ReadWrite => nix::fcntl::OFlag::O_RDWR,
-    };
-    nix::fcntl::open(path, oflag, nix::sys::stat::Mode::empty())
-        .map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
-}
-
-enum PtrType<T> {
-    ConstPtr(*const T),
-    MutPtr(*mut T),
-}
-
-impl<T> PtrType<T> {
-    fn const_ptr(&self) -> *const T {
-        match self {
-            PtrType::ConstPtr(ptr) => *ptr,
-            PtrType::MutPtr(ptr) => *ptr as *const T,
+        if start > end || end > self.total_size {
+            return Err(Error::InvalidRange);
         }
+
+        if start == end {
+            return Ok(Ref {
+                lock_guards: Vec::new(),
+            });
+        }
+
+        // Find the first file of the range:
+        let (file_idx, offset) = match self.cumulative_sizes.binary_search(&start) {
+            Err(idx) => (idx - 1, start - self.cumulative_sizes[idx]),
+            Ok(idx) => (idx, 0),
+        };
+        // The offset must be within the file:
+        assert!(offset < self.paths_and_sizes[file_idx].1);
+
+        // Lock all the required pages in the cache:
+        let mut lock_guards = Vec::new();
+        // TODO: to be continued...
+
+        Ok(Ref { lock_guards })
     }
+}
+
+pub struct Ref {
+    lock_guards: Vec<()>,
 }
 
 /// Try its best to decide if the first existing ancestor of a path is a
@@ -240,7 +253,7 @@ fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
                 // writable, otherwise succeed.
                 return if !metadata.is_dir() {
                     Err(Error::NotADirectory)
-                } else if !metadata.permissions().readonly() {
+                } else if metadata.permissions().readonly() {
                     // TODO: try to test for permissions more reliably, possibly
                     // using platform specific calls.
                     Err(Error::IOError(ErrorKind::PermissionDenied.into()))
@@ -261,63 +274,25 @@ fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
     Err(Error::IOError(last_err))
 }
 
-struct MMap {
-    ptr: PtrType<u8>,
-    len: NonZeroUsize,
-}
-
-impl MMap {
-    fn from_fd(
-        fd: BorrowedFd,
-        mode: FileMode,
-        from: off_t,
-        len: NonZeroUsize,
-    ) -> nix::Result<MMap> {
-        let flags = match mode {
-            FileMode::ReadOnly => ProtFlags::PROT_READ,
-            FileMode::ReadWrite => ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-        };
-
-        let ptr;
-        unsafe {
-            let void_ptr = nix::sys::mman::mmap(
-                None,
-                len,
-                flags,
-                nix::sys::mman::MapFlags::MAP_SHARED,
-                fd.as_raw_fd(),
-                from,
-            )?;
-
-            ptr = match mode {
-                FileMode::ReadOnly => PtrType::ConstPtr(void_ptr as *const u8),
-                FileMode::ReadWrite => PtrType::MutPtr(void_ptr as *mut u8),
-            }
-        }
-
-        Ok(MMap { ptr, len })
-    }
-
-    fn get_mut(&self) -> Option<&mut [u8]> {
-        match &self.ptr {
-            PtrType::ConstPtr(_) => None,
-            PtrType::MutPtr(ptr) => {
-                Some(unsafe { std::slice::from_raw_parts_mut(*ptr, self.len.into()) })
-            }
-        }
-    }
-}
-
-impl Drop for MMap {
-    fn drop(&mut self) {
-        unsafe {
-            nix::sys::mman::munmap(self.ptr.const_ptr() as *mut c_void, self.len.into()).unwrap();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::{cache::Cache, FileGroup};
+
     #[test]
-    fn empty() {}
+    fn create_write() {
+        let cache = Arc::new(Cache {});
+        let fg = FileGroup::new(
+            cache,
+            &[("/tmp/xoxoxo", 43)],
+            crate::Mode::ReadWrite {
+                reserve: true,
+                truncate: true,
+            },
+            true,
+        )
+        .unwrap();
+        fg.get(4..1);
+    }
 }
