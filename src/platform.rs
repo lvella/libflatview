@@ -6,7 +6,12 @@ use crate::Error;
 
 lazy_static! {
     /// The page size.
-    static ref PAGESIZE: u64 = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as u64;
+    pub static ref PAGESIZE: u64 = {
+        let page = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as u64;
+        // Assert a page is a positive power of two (kinda silly, I know)
+        assert!(page > 0 && (page & (page - 1)) == 0);
+        page
+    };
 }
 
 impl From<nix::errno::Errno> for Error {

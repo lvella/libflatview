@@ -57,6 +57,9 @@ pub struct FileGroup {
     /// globally by the all the file groups sharing it.
     cache: Arc<Cache>,
 
+    /// Unique identifier inside the cache.
+    unique_id: u64,
+
     /// Tells if this is in read-only mode.
     is_read_only: bool,
 
@@ -181,7 +184,12 @@ impl FileGroup {
             })
             .collect();
 
+        let unique_id = shared_cache
+            .identifier_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(FileGroup {
+            unique_id,
             cache: shared_cache,
             is_read_only,
             paths_and_sizes,
@@ -192,7 +200,7 @@ impl FileGroup {
 
     pub fn get(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
         // Sanitize range bounds:
-        let start = match range.start_bound() {
+        let mut start = match range.start_bound() {
             std::ops::Bound::Included(x) => *x,
             std::ops::Bound::Excluded(x) => *x + 1,
             std::ops::Bound::Unbounded => 0,
@@ -223,9 +231,24 @@ impl FileGroup {
 
         // Lock all the required pages in the cache:
         let mut lock_guards = Vec::new();
-        // TODO: to be continued...
+        {
+            let mut cache = self.cache.inner.lock().unwrap();
+            /*while start < end {
+                cache.
+            }*/
+            todo!();
+        }
 
         Ok(Ref { lock_guards })
+    }
+}
+
+impl Drop for FileGroup {
+    fn drop(&mut self) {
+        // Remove all cached elements for this FileGroup. The trouble if we
+        // don't do it, is that if a file is deleted from the system, but still
+        // remains mapped in our cache, it will still take up space on storage.
+        todo!()
     }
 }
 
@@ -278,11 +301,14 @@ fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{cache::Cache, FileGroup};
+    use crate::{
+        cache::{Cache, CacheOptions},
+        FileGroup,
+    };
 
     #[test]
     fn create_write() {
-        let cache = Arc::new(Cache {});
+        let cache = Arc::new(Cache::default());
         let fg = FileGroup::new(
             cache,
             &[("/tmp/xoxoxo", 43)],
