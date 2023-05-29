@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    io,
-    sync::{atomic::AtomicU64, Mutex},
-};
+use std::{collections::HashMap, io, sync::Mutex};
 
 use linked_hash_map::LinkedHashMap;
 use memmap2::MmapRaw;
@@ -62,11 +58,6 @@ impl CacheOptions {
 #[derive(Debug)]
 pub struct Cache {
     pub(crate) inner: Mutex<CacheImpl>,
-
-    /// Every FileGroup created from this Cache will have a global unique
-    /// identifier, that it will use as part of the key for queries in the
-    /// cache. This counter provides the keys.
-    pub(crate) identifier_counter: AtomicU64,
 }
 
 impl Cache {
@@ -91,9 +82,8 @@ impl Cache {
                     lru_fifo: LinkedHashMap::new(),
                     total_mapped_size: 0,
                     options,
+                    identifier_counter: 0,
                 }),
-
-                identifier_counter: AtomicU64::new(0),
             })
         }
     }
@@ -105,9 +95,8 @@ impl Cache {
                 lru_fifo: LinkedHashMap::new(),
                 total_mapped_size: 0,
                 options: CacheOptions::default(),
+                identifier_counter: 0,
             }),
-
-            identifier_counter: AtomicU64::new(0),
         }
     }
 }
@@ -118,6 +107,11 @@ pub(crate) struct CacheImpl {
     options: CacheOptions,
     lru_fifo: LinkedHashMap<(u64, u64), ()>,
     total_mapped_size: usize,
+
+    /// Every FileGroup created from this Cache will have a global unique
+    /// identifier, that it will use as part of the key for queries in the
+    /// cache. This counter provides the keys.
+    identifier_counter: u64,
 }
 
 impl CacheImpl {
@@ -180,6 +174,12 @@ impl CacheImpl {
 
     pub(crate) fn get_options(&self) -> &CacheOptions {
         &self.options
+    }
+
+    pub(crate) fn get_unique_id(&mut self) -> u64 {
+        let id = self.identifier_counter;
+        self.identifier_counter += 1;
+        id
     }
 
     /// Drops the least recently used (LRU) elements until cache is within

@@ -193,16 +193,11 @@ impl FileGroup {
             })
             .collect();
 
-        let unique_id = shared_cache
-            .identifier_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (unique_id, max_mapping_size) = {
+            let mut cache = shared_cache.inner.lock().unwrap();
 
-        let max_mapping_size = shared_cache
-            .inner
-            .lock()
-            .unwrap()
-            .get_options()
-            .max_mapping_size;
+            (cache.get_unique_id(), cache.get_options().max_mapping_size)
+        };
 
         Ok(FileGroup {
             unique_id,
