@@ -2,14 +2,14 @@ use std::os::fd::RawFd;
 
 use lazy_static::lazy_static;
 
-use crate::Error;
+use crate::{is_power_of_two, Error};
 
 lazy_static! {
     /// The page size.
     pub static ref PAGESIZE: u64 = {
         let page = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).unwrap().unwrap() as u64;
-        // Assert a page is a positive power of two (kinda silly, I know)
-        assert!(page > 0 && (page & (page - 1)) == 0);
+        // Assert a page is a power of two (kinda silly, I know)
+        assert!(is_power_of_two(page));
         page
     };
 }

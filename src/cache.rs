@@ -7,7 +7,7 @@ use std::{
 use linked_hash_map::LinkedHashMap;
 use memmap2::MmapRaw;
 
-use crate::platform::PAGESIZE;
+use crate::{is_power_of_two, platform::PAGESIZE};
 
 /// Resources limit options for a `Cache`.
 ///
@@ -15,12 +15,12 @@ use crate::platform::PAGESIZE;
 /// for.
 #[derive(Debug, Clone)]
 pub struct CacheOptions {
-    /// The maximum size of one single mapping, in bytes. Must be multiple of
-    /// the page size.
+    /// The maximum size of one single mapping, in bytes. Must be a power of two
+    /// and bigger than the page size.
     pub max_mapping_size: usize,
 
     /// The maximum size, in bytes, that is mapped simultaneously for cache.
-    /// Also must be multiple of the page size.
+    /// Must be multiple of the page size.
     pub max_total_mapped: usize,
 
     /// Maximum number of individual mappings. Linux distributions usually
@@ -44,6 +44,7 @@ impl CacheOptions {
     pub const fn default() -> Self {
         // TODO: tune this settings to 32 bits systems.
         const PTR_SIZE: u32 = if usize::BITS > 48 { 48 } else { usize::BITS };
+        // TODO: this doesn't fit in windows's iovec, fix it:
         const MAX_MAPPING_SIZE: usize = 1usize << (PTR_SIZE - 8);
         const MAX_TOTAL_MAPPED: usize = 1usize << (PTR_SIZE - 3);
         const MAX_MAPPING_COUNT: u32 = 1u32 << 15;
@@ -58,6 +59,7 @@ impl CacheOptions {
 /// Cache of file mappings shared between many `FileGroup`s. This will control
 /// the resource usage of the `FileGroup`s sharing this cache. The idea is that
 /// the user will only need one `Cache` per application.
+#[derive(Debug)]
 pub struct Cache {
     pub(crate) inner: Mutex<CacheImpl>,
 
@@ -70,8 +72,11 @@ pub struct Cache {
 impl Cache {
     pub fn new(options: CacheOptions) -> Option<Self> {
         // TODO: return an error type instead of a None
-        if options.max_mapping_size % *PAGESIZE as usize != 0 {
-            // `max_mapping_size` is not multiple of the page size
+        if options.max_mapping_size < *PAGESIZE as usize {
+            // `max_mapping_size` is smaller than
+            None
+        } else if !is_power_of_two(options.max_mapping_size) {
+            // `max_mapping_size` is not a power of two
             None
         } else if options.max_total_mapped % *PAGESIZE as usize != 0 {
             // `max_total_mapped` is not multiple of the page size
@@ -107,6 +112,7 @@ impl Cache {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CacheImpl {
     cache: HashMap<(u64, u64), (MmapRaw, usize)>,
     options: CacheOptions,
@@ -145,7 +151,7 @@ impl CacheImpl {
                 assert!(page_rounded_len < self.options.max_mapping_size);
                 self.total_mapped_size += round_to_whole_pages(mapping.len());
 
-                // Take the return value here so that we "unborrow" self, and
+                // Create the return value here so that we "unborrow" self, and
                 // maybe_drop_cached() can be called.
                 let ret = Ok((mapping.as_ptr(), mapping.len()));
 
@@ -170,6 +176,10 @@ impl CacheImpl {
             // No more users, add it to the LRU fifo.
             self.lru_fifo.insert(key, ());
         }
+    }
+
+    pub(crate) fn get_options(&self) -> &CacheOptions {
+        &self.options
     }
 
     /// Drops the least recently used (LRU) elements until cache is within
