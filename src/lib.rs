@@ -1,16 +1,14 @@
 pub mod cache;
 mod platform;
 
-use cache::{Cache, CacheImpl};
-use core::slice;
+use cache::Cache;
 use memmap2::MmapOptions;
 use platform::preallocate_file;
 use std::{
-    fmt::Alignment,
     fs::{self, OpenOptions},
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     iter::FusedIterator,
-    ops::{Range, RangeBounds},
+    ops::RangeBounds,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     ptr,
@@ -210,9 +208,9 @@ impl FileGroup {
         })
     }
 
-    pub fn get(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
-        // Sanitize range bounds:
-        let mut start = match range.start_bound() {
+    /// Convert all kinds of ranges to absolute values.
+    fn unpack_range(&self, range: impl RangeBounds<u64>) -> (u64, u64) {
+        let start = match range.start_bound() {
             std::ops::Bound::Included(x) => *x,
             std::ops::Bound::Excluded(x) => *x + 1,
             std::ops::Bound::Unbounded => 0,
@@ -222,16 +220,24 @@ impl FileGroup {
             std::ops::Bound::Excluded(x) => *x,
             std::ops::Bound::Unbounded => self.total_size,
         };
+        (start, end)
+    }
 
+    fn raw_get<'a, S: U8Slice<'a>>(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<(ChunksReleaser, Vec<S>), Error> {
+        // Sanitize range bounds:
         if start > end || end > self.total_size {
             return Err(Error::InvalidRange);
         }
         if start == end {
-            return Ok(Ref {
+            return Ok((
                 // Dummy fused iter:
-                chunk_iter: self.chunks(0, 0, 0).0,
-                slices: Vec::new(),
-            });
+                ChunksReleaser(self.chunks(0, 0, 0).0),
+                Vec::new(),
+            ));
         }
         let len = end - start;
 
@@ -254,72 +260,98 @@ impl FileGroup {
         // concurrently write+write and read+write to the same place.
 
         // Split the range in file chuncks, and the get slices from the cache.
-        let (chunk_iter, initial_offset) = self.chunks(file_idx, offset, len);
-        let mut slices;
-        let mut err = None;
-        {
-            let mut cache = self.cache.inner.lock().unwrap();
-            slices = chunk_iter
-                .clone()
-                .map_while(|chunk| {
-                    match cache.get_inc(self.unique_id, chunk.group_offset, || {
-                        let mut options = MmapOptions::new();
-                        options.offset(chunk.file_offset).len(chunk.len as usize);
+        let (chunk_iter, mut initial_offset) = self.chunks(file_idx, offset, len);
 
-                        let file = OpenOptions::new()
-                            .read(true)
-                            .write(!self.is_read_only)
-                            .create(true)
-                            .open(&self.paths_and_sizes[chunk.file_idx].0)?;
+        let mut chunks_locked_count = 0u32;
+        let mut cache = self.cache.inner.lock().unwrap();
 
-                        if self.is_read_only {
-                            options.map_raw_read_only(&file)
-                        } else {
-                            options.map_raw(&file)
-                        }
-                    }) {
-                        Ok(ptr) => Some(ptr::slice_from_raw_parts(ptr.0, ptr.1)),
-                        Err(e) => {
-                            err = Some(e);
-                            None
-                        }
+        match chunk_iter
+            .clone()
+            .map(|chunk| -> Result<S, Error> {
+                let raw_slice = cache.get_inc(self.unique_id, chunk.group_offset, || {
+                    let mut options = MmapOptions::new();
+                    options.offset(chunk.file_offset).len(chunk.len as usize);
+
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(!self.is_read_only)
+                        .create(true)
+                        .open(&self.paths_and_sizes[chunk.file_idx].0)?;
+
+                    if self.is_read_only {
+                        options.map_raw_read_only(&file)
+                    } else {
+                        options.map_raw(&file)
                     }
-                })
-                .collect::<Vec<_>>();
+                })?;
 
-            if let Some(err) = err {
+                // Must carefully monitor how many chunks got locked, so that we
+                // know how many to free in case of error:
+                chunks_locked_count += 1;
+
+                // First chunk is special because we have to apply
+                // offset to it.
+                //
+                // SAFETY: initial_offset will always be smaller
+                // than the length of the first chunk, so this is
+                // safe.
+                let ptr = unsafe { raw_slice.0.offset(initial_offset as isize) };
+                // Next chunks won't be adjusted:
+                initial_offset = 0;
+
+                // SAFETY: this is safe because the pointer won't be freed until
+                // the corresponding `put_dec()` is issued.
+                //
+                // TODO: this will panic on windows if raw_slice.1 is greater
+                // than 4 GB. Fix it, possibly breaking this up in slices of 4
+                // GB.
+                unsafe { Ok(S::from_raw_parts(ptr, raw_slice.1 as u64)) }
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(slices) => Ok((ChunksReleaser(chunk_iter), slices)),
+            Err(err) => {
                 // In case of mapping error, we have to manually release the
                 // chunks that where successfully acquired, because the Ref
                 // object that would do it on drop hasn't been created yet.
                 //
                 // Because of this lack of RAII, I am tempted to mark
                 // `get_inc()` as unsafe, but since `Box::leak()` isn't, I wont.
-                for (chunk, _) in chunk_iter.zip(slices) {
+                for chunk in chunk_iter.take(chunks_locked_count as usize) {
                     cache.put_dec(self.unique_id, chunk.group_offset);
                 }
 
-                return Err(err.into());
+                Err(err.into())
             }
-        } // Mutex unlock.
+        }
+    }
 
-        // The first slice must be readjusted to the user requested start, as
-        // the start had to be aligned to the page boundary.
-        //
-        // SAFETY: the slice will be held by cache until its corresponding
-        // `put_dec() call`, so it is safe to be dereferenced.
-        slices[0] = &unsafe { &*slices[0] }[initial_offset as usize..];
+    /// Gets a read-only reference to a range.
+    pub fn get(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
+        let (start, end) = self.unpack_range(range);
+        let (releaser, slices) = self.raw_get(start, end)?;
+        Ok(Ref { releaser, slices })
+    }
 
-        Ok(Ref { chunk_iter, slices })
+    /// Gets a read-write reference to a range.
+    ///
+    /// This is unsafe because the caller must ensure there is no other reader
+    /// or writer to this same range across all threads, so that the returned
+    /// range does not violates rust's aliasing rules.
+    pub unsafe fn get_mut_unchecked(&self, range: impl RangeBounds<u64>) -> Result<RefMut, Error> {
+        let (start, end) = self.unpack_range(range);
+        let (releaser, slices) = self.raw_get(start, end)?;
+        Ok(RefMut { releaser, slices })
     }
 
     /// Returns the iterator among file's chunks, and the offset of the fisrt
     /// byte into the first chunk.
-    fn chunks(&self, file_idx: usize, offset: u64, len: u64) -> (ChunkIter, u64) {
+    fn chunks(&self, file_idx: usize, offset: u64, len: u64) -> (ChunkIter, u32) {
         // Zero the lower bits of offset to be aligned to max_mapping_size.
         let mask = self.max_mapping_size as u64 - 1;
         let next_file_offset = offset & !mask;
-        let initial_chunk_offset = offset & mask;
-        let remaining_bytes = len + initial_chunk_offset;
+        let initial_chunk_offset = (offset & mask) as u32;
+        let remaining_bytes = len + initial_chunk_offset as u64;
         (
             ChunkIter {
                 group: self,
@@ -342,6 +374,28 @@ impl Drop for FileGroup {
             .lock()
             .unwrap()
             .remove_file_group(self.unique_id);
+    }
+}
+
+trait U8Slice<'a>
+where
+    Self: Sized,
+{
+    unsafe fn from_raw_parts(ptr: *const u8, len: u64) -> Self;
+}
+
+impl<'a> U8Slice<'a> for IoSlice<'a> {
+    unsafe fn from_raw_parts(ptr: *const u8, len: u64) -> Self {
+        Self::new(&*ptr::slice_from_raw_parts(ptr, len as usize))
+    }
+}
+
+impl<'a> U8Slice<'a> for IoSliceMut<'a> {
+    unsafe fn from_raw_parts(ptr: *const u8, len: u64) -> Self {
+        Self::new(&mut *ptr::slice_from_raw_parts_mut(
+            ptr as *mut u8,
+            len as usize,
+        ))
     }
 }
 
@@ -404,16 +458,32 @@ impl<'a> Iterator for ChunkIter<'a> {
 impl<'a> FusedIterator for ChunkIter<'a> {}
 
 pub struct Ref<'a> {
-    chunk_iter: ChunkIter<'a>,
-    slices: Vec<*const [u8]>,
+    releaser: ChunksReleaser<'a>,
+
+    /// This lifetime 'a is wrong! The IoSlices shown here will live just as
+    /// long as the struct itself. Upon `drop` they might be become invalid. In
+    /// comparison 'a is longer lived, as it is the lifetime of the FileGroup
+    /// object. Ideally, this lifetime should be the 'self discussed here:
+    /// https://users.rust-lang.org/t/access-to-implicit-lifetime-of-containing-object-aka-self-lifetime/18917
+    /// unfortunately, that doesn't exists.
+    slices: Vec<IoSlice<'a>>,
 }
 
-impl<'a> Drop for Ref<'a> {
+pub struct RefMut<'a> {
+    releaser: ChunksReleaser<'a>,
+
+    /// This lifetime 'a is wrong! See `Ref`.
+    slices: Vec<IoSliceMut<'a>>,
+}
+
+struct ChunksReleaser<'a>(ChunkIter<'a>);
+
+impl<'a> Drop for ChunksReleaser<'a> {
     fn drop(&mut self) {
         // Release all the chunks locked for this ref.
-        let group = self.chunk_iter.group;
+        let group = self.0.group;
         let mut cache = group.cache.inner.lock().unwrap();
-        for chunk in self.chunk_iter.clone() {
+        for chunk in self.0.clone() {
             cache.put_dec(group.unique_id, chunk.group_offset);
         }
     }

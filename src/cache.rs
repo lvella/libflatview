@@ -40,7 +40,7 @@ impl CacheOptions {
     pub const fn default() -> Self {
         // TODO: tune this settings to 32 bits systems.
         const PTR_SIZE: u32 = if usize::BITS > 48 { 48 } else { usize::BITS };
-        // TODO: this doesn't fit in windows's iovec, fix it:
+
         const MAX_MAPPING_SIZE: usize = 1usize << (PTR_SIZE - 8);
         const MAX_TOTAL_MAPPED: usize = 1usize << (PTR_SIZE - 3);
         const MAX_MAPPING_COUNT: u32 = 1u32 << 15;
