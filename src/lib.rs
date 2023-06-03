@@ -25,7 +25,7 @@ pub enum Error {
     NotAFile,
     #[error("path component is not a directory")]
     NotADirectory,
-    #[error("a write write was attempted on read-only mode")]
+    #[error("a write was attempted on read-only mode")]
     ReadOnlyMode,
     #[error("the range requested is invalid")]
     InvalidRange,
@@ -262,68 +262,76 @@ impl FileGroup {
         // Split the range in file chuncks, and the get slices from the cache.
         let (chunk_iter, mut initial_offset) = self.chunks(file_idx, offset, len);
 
-        let mut chunks_locked_count = 0u32;
+        let mut slices = Vec::new();
         let mut cache = self.cache.inner.lock().unwrap();
+        for (loop_count, chunk) in chunk_iter.clone().enumerate() {
+            let get_result = cache.get_inc(self.unique_id, chunk.group_offset, || {
+                let mut options = MmapOptions::new();
+                options.offset(chunk.file_offset).len(chunk.len as usize);
 
-        match chunk_iter
-            .clone()
-            .map(|chunk| -> Result<S, Error> {
-                let raw_slice = cache.get_inc(self.unique_id, chunk.group_offset, || {
-                    let mut options = MmapOptions::new();
-                    options.offset(chunk.file_offset).len(chunk.len as usize);
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(!self.is_read_only)
+                    .create(true)
+                    .open(&self.paths_and_sizes[chunk.file_idx].0)?;
 
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(!self.is_read_only)
-                        .create(true)
-                        .open(&self.paths_and_sizes[chunk.file_idx].0)?;
-
-                    if self.is_read_only {
-                        options.map_raw_read_only(&file)
-                    } else {
-                        options.map_raw(&file)
-                    }
-                })?;
-
-                // Must carefully monitor how many chunks got locked, so that we
-                // know how many to free in case of error:
-                chunks_locked_count += 1;
-
-                // First chunk is special because we have to apply
-                // offset to it.
-                //
-                // SAFETY: initial_offset will always be smaller
-                // than the length of the first chunk, so this is
-                // safe.
-                let ptr = unsafe { raw_slice.0.offset(initial_offset as isize) };
-                // Next chunks won't be adjusted:
-                initial_offset = 0;
-
-                // SAFETY: this is safe because the pointer won't be freed until
-                // the corresponding `put_dec()` is issued.
-                //
-                // TODO: this will panic on windows if raw_slice.1 is greater
-                // than 4 GB. Fix it, possibly breaking this up in slices of 4
-                // GB.
-                unsafe { Ok(S::from_raw_parts(ptr, raw_slice.1 as u64)) }
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(slices) => Ok((ChunksReleaser(chunk_iter), slices)),
-            Err(err) => {
-                // In case of mapping error, we have to manually release the
-                // chunks that where successfully acquired, because the Ref
-                // object that would do it on drop hasn't been created yet.
-                //
-                // Because of this lack of RAII, I am tempted to mark
-                // `get_inc()` as unsafe, but since `Box::leak()` isn't, I wont.
-                for chunk in chunk_iter.take(chunks_locked_count as usize) {
-                    cache.put_dec(self.unique_id, chunk.group_offset);
+                if self.is_read_only {
+                    options.map_raw_read_only(&file)
+                } else {
+                    options.map_raw(&file)
                 }
+            });
 
-                Err(err.into())
+            match get_result {
+                Ok((ptr, mut len)) => {
+                    // First chunk is special because we have to apply
+                    // offset to it.
+                    //
+                    // SAFETY: initial_offset will always be smaller
+                    // than the length of the first chunk, so this is
+                    // safe.
+                    let mut ptr = unsafe { ptr.offset(initial_offset as isize) };
+                    // Next chunks won't be adjusted:
+                    initial_offset = 0;
+
+                    // SAFETY: this is safe because the pointer won't be freed until
+                    // the corresponding `put_dec()` is issued.
+                    unsafe {
+                        if cfg!(all(windows, target_pointer_width = "64")) {
+                            // On Windows 64 bits, it is possible that a single
+                            // chunk to be bigger than the maximum size of its
+                            // 32-bit IoSlice. We have to break it up in smaller
+                            // IoSlices.
+                            while len > u32::MAX as usize {
+                                slices.push(S::from_raw_parts(ptr, u32::MAX as u64));
+
+                                ptr = ptr.offset(u32::MAX as isize);
+                                len -= u32::MAX as usize;
+                            }
+                        }
+
+                        slices.push(S::from_raw_parts(ptr, len as u64));
+                    }
+                }
+                Err(err) => {
+                    // In case of mapping error, we have to manually release the
+                    // chunks that where successfully acquired, because the
+                    // `ChunksReleaser` object that would do it on drop hasn't
+                    // been created yet.
+                    //
+                    // Due to this lack of RAII, I am tempted to mark
+                    // `CacheImpl::get_inc()` as unsafe, but since `Box::leak()`
+                    // isn't, I wont.
+                    for chunk in chunk_iter.take(loop_count) {
+                        cache.put_dec(self.unique_id, chunk.group_offset);
+                    }
+
+                    return Err(err.into());
+                }
             }
         }
+
+        Ok((ChunksReleaser(chunk_iter), slices))
     }
 
     /// Gets a read-only reference to a range.
@@ -339,6 +347,9 @@ impl FileGroup {
     /// or writer to this same range across all threads, so that the returned
     /// range does not violates rust's aliasing rules.
     pub unsafe fn get_mut_unchecked(&self, range: impl RangeBounds<u64>) -> Result<RefMut, Error> {
+        if self.is_read_only {
+            return Err(Error::ReadOnlyMode);
+        }
         let (start, end) = self.unpack_range(range);
         let (releaser, slices) = self.raw_get(start, end)?;
         Ok(RefMut { releaser, slices })
