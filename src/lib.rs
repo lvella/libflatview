@@ -337,7 +337,11 @@ impl Drop for FileGroup {
         // Remove all cached elements for this FileGroup. The trouble if we
         // don't do it is that if a file is deleted from the system while still
         // mapped in our cache, it will still take up space on storage.
-        todo!()
+        self.cache
+            .inner
+            .lock()
+            .unwrap()
+            .remove_file_group(self.unique_id);
     }
 }
 

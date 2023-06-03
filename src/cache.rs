@@ -182,6 +182,16 @@ impl CacheImpl {
         id
     }
 
+    /// Frees all not in-use cache entries of a FileGroup.
+    pub fn remove_file_group(&mut self, group_id: u64) {
+        for e in self.lru_fifo.entries() {
+            if e.key().0 == group_id {
+                assert_eq!(self.cache.remove(e.key()).unwrap().1, 0);
+                e.remove();
+            }
+        }
+    }
+
     /// Drops the least recently used (LRU) elements until cache is within
     /// configured limits.
     fn maybe_drop_cached(&mut self) {
@@ -195,15 +205,14 @@ impl CacheImpl {
                     self.total_mapped_size -= round_to_whole_pages(removed.len());
                 }
                 None => {
-                    // It is pathological that the maximum limits have been
-                    // reached, but there are no entries to be dropped. But it
-                    // is not necessarily a bug: it is possible that every entry
-                    // are in use right now, so there is nothing else to do.
+                    // It is unlikely that the maximum limits have been reached,
+                    // but there are no entries to be dropped. But it is not
+                    // necessarily a bug: it is possible that every entry are in
+                    // use right now, so there is nothing else to do.
                     break;
                 }
             }
         }
-        todo!()
     }
 }
 
