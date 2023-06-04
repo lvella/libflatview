@@ -8,7 +8,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     iter::FusedIterator,
-    ops::RangeBounds,
+    ops::{Deref, DerefMut, RangeBounds},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     ptr,
@@ -334,25 +334,34 @@ impl FileGroup {
         Ok((ChunksReleaser(chunk_iter), slices))
     }
 
-    /// Gets a read-only reference to a range.
-    pub fn get(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
+    /// Borrows a read-only reference to a range.
+    pub fn borrow(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
         let (start, end) = self.unpack_range(range);
         let (releaser, slices) = self.raw_get(start, end)?;
-        Ok(Ref { releaser, slices })
+        Ok(Ref {
+            _releaser: releaser,
+            slices,
+        })
     }
 
-    /// Gets a read-write reference to a range.
+    /// Borrows a read-write reference to a range.
     ///
     /// This is unsafe because the caller must ensure there is no other reader
     /// or writer to this same range across all threads, so that the returned
     /// range does not violates rust's aliasing rules.
-    pub unsafe fn get_mut_unchecked(&self, range: impl RangeBounds<u64>) -> Result<RefMut, Error> {
+    pub unsafe fn borrow_mut_unchecked(
+        &self,
+        range: impl RangeBounds<u64>,
+    ) -> Result<RefMut, Error> {
         if self.is_read_only {
             return Err(Error::ReadOnlyMode);
         }
         let (start, end) = self.unpack_range(range);
         let (releaser, slices) = self.raw_get(start, end)?;
-        Ok(RefMut { releaser, slices })
+        Ok(RefMut {
+            _releaser: releaser,
+            slices,
+        })
     }
 
     /// Returns the iterator among file's chunks, and the offset of the fisrt
@@ -468,25 +477,6 @@ impl<'a> Iterator for ChunkIter<'a> {
 
 impl<'a> FusedIterator for ChunkIter<'a> {}
 
-pub struct Ref<'a> {
-    releaser: ChunksReleaser<'a>,
-
-    /// This lifetime 'a is wrong! The IoSlices shown here will live just as
-    /// long as the struct itself. Upon `drop` they might be become invalid. In
-    /// comparison 'a is longer lived, as it is the lifetime of the FileGroup
-    /// object. Ideally, this lifetime should be the 'self discussed here:
-    /// https://users.rust-lang.org/t/access-to-implicit-lifetime-of-containing-object-aka-self-lifetime/18917
-    /// unfortunately, that doesn't exists.
-    slices: Vec<IoSlice<'a>>,
-}
-
-pub struct RefMut<'a> {
-    releaser: ChunksReleaser<'a>,
-
-    /// This lifetime 'a is wrong! See `Ref`.
-    slices: Vec<IoSliceMut<'a>>,
-}
-
 struct ChunksReleaser<'a>(ChunkIter<'a>);
 
 impl<'a> Drop for ChunksReleaser<'a> {
@@ -497,6 +487,62 @@ impl<'a> Drop for ChunksReleaser<'a> {
         for chunk in self.0.clone() {
             cache.put_dec(group.unique_id, chunk.group_offset);
         }
+    }
+}
+
+/// Holds a borrowed range.
+///
+/// Lifetime `'a` is the lifetime of the parent `FileGroup`, and `'s` is
+/// supposed to be the lifetime of this struct itself, but it must be bound to
+/// `&'s self` by the accessor functions.
+///
+/// Deref should NOT be implemented for this type! It could cause dangling
+/// references and all kind of memory hazards!
+///
+/// The reason is that Deref expects the referenced object to be able to outlive
+/// `Self` (i.e., `obj.deref().to_owned()` should live independently of `obj`).
+/// This is not the case here: our pointed object `[IoSlice<'s>]` contains
+/// references whose lifetime should be bound to the `Ref` object.
+pub struct Ref<'a, 's>
+where
+    'a: 's,
+{
+    _releaser: ChunksReleaser<'a>,
+    slices: Vec<IoSlice<'s>>,
+}
+
+impl<'a, 's> Ref<'a, 's> {
+    pub fn get(&'s self) -> &'s [IoSlice<'s>] {
+        &self.slices
+    }
+}
+
+//DON'T DO THIS, this is wrong! It would allow the returned `IoSlice<'s>` to
+// outlive its `Ref<'a, 's>`:
+/*
+impl<'a, 's> Deref for Ref<'a, 's> {
+    type Target = [IoSlice<'s>];
+
+    fn deref(&self) -> &[IoSlice<'s>] {
+        &self.slices
+    }
+}
+*/
+
+/// Holds a borrowed mutable range.
+///
+/// See `Ref` documentation for lifetime considerations.
+pub struct RefMut<'a, 's>
+where
+    'a: 's,
+{
+    _releaser: ChunksReleaser<'a>,
+    slices: Vec<IoSliceMut<'s>>,
+}
+
+impl<'a, 's> RefMut<'a, 's> {
+    pub fn get(&'s mut self) -> &'s mut [IoSliceMut<'s>] {
+        &mut self.slices
     }
 }
 
@@ -547,23 +593,35 @@ fn is_power_of_two<T: num_traits::Unsigned + std::ops::BitAnd<Output = T> + Copy
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io::IoSliceMut, sync::Arc};
 
     use crate::{cache::Cache, FileGroup};
 
     #[test]
     fn create_write() {
-        let cache = Arc::new(Cache::default());
-        let fg = FileGroup::new(
-            cache,
-            &[("/tmp/xoxoxo", 43)],
-            crate::Mode::ReadWrite {
-                reserve: true,
-                truncate: true,
-            },
-            true,
-        )
-        .unwrap();
-        fg.get(4..1);
+        {
+            let cache = Arc::new(Cache::default());
+            let fg = FileGroup::new(
+                cache,
+                &[("/tmp/xoxoxo", 43)],
+                crate::Mode::ReadWrite {
+                    reserve: true,
+                    truncate: true,
+                },
+                true,
+            )
+            .unwrap();
+
+            let mut my_slices = Vec::new();
+            {
+                let mut r = unsafe { fg.borrow_mut_unchecked(0..4).unwrap() };
+                let aaa = r.get();
+                for s in aaa {
+                    s[0] = 42;
+                    my_slices.push(std::mem::replace(s, IoSliceMut::new(&mut [])));
+                }
+            }
+            //my_slices[0][1] = 43;
+        }
     }
 }
