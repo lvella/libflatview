@@ -103,6 +103,15 @@ impl Cache {
 
 #[derive(Debug)]
 pub(crate) struct CacheImpl {
+    /// Stores the cached entries.
+    ///
+    /// Key is unique id of the FileGroup, and the global position inside it.
+    ///
+    /// Value is the mapping, and the number of users.
+    ///
+    /// TODO: maybe use an atomic value as the counter to reduce contention, so
+    /// this can be placed in a RwLock instead of wrapping the entire struct in
+    /// a mutex, and cache hits will only need a read lock.
     cache: HashMap<(u64, u64), (MmapRaw, usize)>,
     options: CacheOptions,
     lru_fifo: LinkedHashMap<(u64, u64), ()>,
@@ -125,7 +134,7 @@ impl CacheImpl {
         group_id: u64,
         offset: u64,
         creator: impl FnOnce() -> io::Result<MmapRaw>,
-    ) -> io::Result<(*const u8, usize)> {
+    ) -> io::Result<*const u8> {
         match self.cache.entry((group_id, offset)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 // Remove entry from the LRU fifo, because it is now in use and
@@ -135,7 +144,7 @@ impl CacheImpl {
                 let val = entry.get_mut();
                 val.1 += 1;
 
-                Ok((val.0.as_ptr(), val.0.len()))
+                Ok(val.0.as_ptr())
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let mapping = &entry.insert((creator()?, 1)).0;
@@ -147,7 +156,7 @@ impl CacheImpl {
 
                 // Create the return value here so that we "unborrow" self, and
                 // maybe_drop_cached() can be called.
-                let ret = Ok((mapping.as_ptr(), mapping.len()));
+                let ret = Ok(mapping.as_ptr());
 
                 self.maybe_drop_cached();
 

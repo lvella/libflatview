@@ -8,7 +8,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     iter::FusedIterator,
-    ops::{Deref, DerefMut, RangeBounds},
+    ops::RangeBounds,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     ptr,
@@ -243,7 +243,7 @@ impl FileGroup {
 
         // Find the first file of the range:
         let (file_idx, offset) = match self.cumulative_sizes.binary_search(&start) {
-            Err(idx) => (idx - 1, start - self.cumulative_sizes[idx]),
+            Err(idx) => (idx - 1, start - self.cumulative_sizes[idx - 1]),
             Ok(idx) => (idx, 0),
         };
         // The offset must be within the file:
@@ -267,12 +267,14 @@ impl FileGroup {
         for (loop_count, chunk) in chunk_iter.clone().enumerate() {
             let get_result = cache.get_inc(self.unique_id, chunk.group_offset, || {
                 let mut options = MmapOptions::new();
-                options.offset(chunk.file_offset).len(chunk.len as usize);
+                options
+                    .offset(chunk.file_offset)
+                    .len(chunk.mapping_len as usize);
 
                 let file = OpenOptions::new()
                     .read(true)
                     .write(!self.is_read_only)
-                    .create(true)
+                    .create(!self.is_read_only)
                     .open(&self.paths_and_sizes[chunk.file_idx].0)?;
 
                 if self.is_read_only {
@@ -283,13 +285,14 @@ impl FileGroup {
             });
 
             match get_result {
-                Ok((ptr, mut len)) => {
+                Ok(ptr) => {
                     // First chunk is special because we have to apply
                     // offset to it.
                     //
                     // SAFETY: initial_offset will always be smaller
                     // than the length of the first chunk, so this is
                     // safe.
+                    let mut len = chunk.user_len - initial_offset;
                     let mut ptr = unsafe { ptr.offset(initial_offset as isize) };
                     // Next chunks won't be adjusted:
                     initial_offset = 0;
@@ -364,13 +367,13 @@ impl FileGroup {
         })
     }
 
-    /// Returns the iterator among file's chunks, and the offset of the fisrt
+    /// Returns the iterator among file's chunks, and the offset of the first
     /// byte into the first chunk.
-    fn chunks(&self, file_idx: usize, offset: u64, len: u64) -> (ChunkIter, u32) {
+    fn chunks(&self, file_idx: usize, offset: u64, len: u64) -> (ChunkIter, usize) {
         // Zero the lower bits of offset to be aligned to max_mapping_size.
         let mask = self.max_mapping_size as u64 - 1;
         let next_file_offset = offset & !mask;
-        let initial_chunk_offset = (offset & mask) as u32;
+        let initial_chunk_offset = (offset & mask) as usize;
         let remaining_bytes = len + initial_chunk_offset as u64;
         (
             ChunkIter {
@@ -434,7 +437,8 @@ struct Chunk {
     file_idx: usize,
     file_offset: u64,
     group_offset: u64,
-    len: u64,
+    mapping_len: usize,
+    user_len: usize,
 }
 
 impl<'a> Iterator for ChunkIter<'a> {
@@ -449,28 +453,31 @@ impl<'a> Iterator for ChunkIter<'a> {
         let file_offset = self.next_file_offset;
 
         let file_size = self.group.paths_and_sizes[file_idx].1;
-        let mut len;
+        let mapping_len;
         self.next_file_offset += self.group.max_mapping_size as u64;
         if self.next_file_offset < file_size {
-            len = self.group.max_mapping_size as u64;
+            mapping_len = self.group.max_mapping_size;
         } else {
-            len = file_size - file_offset;
+            mapping_len = (file_size - file_offset) as usize;
             self.next_file_offset = 0;
             self.next_file_idx += 1;
         }
 
-        if self.remaining_bytes > len {
-            self.remaining_bytes -= len;
+        let user_len;
+        if self.remaining_bytes > mapping_len as u64 {
+            user_len = mapping_len;
+            self.remaining_bytes -= mapping_len as u64;
         } else {
-            len = self.remaining_bytes;
+            user_len = self.remaining_bytes as usize;
             self.remaining_bytes = 0;
-        }
+        };
 
         Some(Chunk {
             file_idx,
             file_offset,
             group_offset: self.group.cumulative_sizes[file_idx] + file_offset,
-            len,
+            mapping_len,
+            user_len,
         })
     }
 }
