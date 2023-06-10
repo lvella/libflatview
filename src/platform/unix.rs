@@ -1,4 +1,4 @@
-use std::os::fd::RawFd;
+use std::{fs::File, os::fd::AsRawFd};
 
 use lazy_static::lazy_static;
 
@@ -20,6 +20,10 @@ impl From<nix::errno::Errno> for Error {
     }
 }
 
-pub fn preallocate_file(fd: RawFd, size: u64) -> Result<(), Error> {
-    Ok(nix::fcntl::posix_fallocate(fd, 0, size as i64)?)
+pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
+    Ok(nix::fcntl::posix_fallocate(
+        file.as_raw_fd(),
+        0,
+        size as i64,
+    )?)
 }

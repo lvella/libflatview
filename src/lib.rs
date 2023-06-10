@@ -9,7 +9,6 @@ use std::{
     io::{self, ErrorKind, IoSlice, IoSliceMut},
     iter::FusedIterator,
     ops::RangeBounds,
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     ptr,
     sync::Arc,
@@ -42,18 +41,23 @@ pub enum Mode {
     /// expected size.
     ///
     /// If `reserve` is set, all non-allocated blocks on sparse files will be
-    /// allocated. This is recommended, because if the application tries to
-    /// write to an unallocated block, but it can't be allocated because the
-    /// storage is full, your application will be signaled with SIGBUS on POSIX,
-    /// and God knows what happens on Windows.
+    /// allocated upon the creation of the `FileGroup`. This is recommended,
+    /// because if the application tries to write to an unallocated block, but
+    /// it can't be allocated because the storage is full, your application will
+    /// be signaled with SIGBUS on POSIX, and God knows what happens on Windows.
     ///
     /// If `truncate` is set, files larger than what they are supposed to be are
     /// truncated.
     ReadWrite { reserve: bool, truncate: bool },
 }
 
-/// A sequence of files with known sizes grouped together as a single
-/// 64-bit addressable byte array.
+/// A sequence of files with known sizes grouped together as a single 64-bit
+/// addressable byte array.
+///
+/// Maybe this should go without saying, but in write mode, the object assumes
+/// it is the sole writer of the file. This obvious, of course, as you always
+/// have a race condition when two threads/processes writes to the same file
+/// without synchronization between them.
 #[derive(Debug)]
 pub struct FileGroup {
     /// Cache shared among other `FileGroup` storing actual file mappings. It
@@ -86,11 +90,13 @@ pub struct FileGroup {
 impl FileGroup {
     /// Creates a new `FileGroup` from a group of file names.
     ///
-    /// Relative paths and symbolic links are resolved at the moment of the
+    /// Relative paths and symbolic links are resolved at the moment of this
     /// call.
     ///  
-    /// If `strict_size` is set, error `Error::WrongSize` if there are files
-    /// larger than the expected.
+    /// If `strict_size` is set, error `Error::WrongSize` is raised if there are
+    /// files larger than the expected.
+    ///
+    /// For the other behaviors you can configure, see `Mode` struct.
     pub fn new(
         shared_cache: Arc<Cache>,
         files_with_sizes: &[(impl AsRef<Path>, u64)],
@@ -146,7 +152,7 @@ impl FileGroup {
                     fs::create_dir_all(dir)?;
                 }
 
-                let file = OpenOptions::new()
+                let mut file = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
@@ -161,7 +167,7 @@ impl FileGroup {
                 }
 
                 if reserve {
-                    preallocate_file(file.as_raw_fd(), *required_size)?;
+                    preallocate_file(&mut file, *required_size)?;
                 }
             }
         }
