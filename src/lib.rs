@@ -603,38 +603,3 @@ fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
 fn is_power_of_two<T: num_traits::Unsigned + std::ops::BitAnd<Output = T> + Copy>(val: T) -> bool {
     !val.is_zero() && (val & (val - T::one())).is_zero()
 }
-
-#[cfg(test)]
-mod tests {
-    use std::{io::IoSliceMut, sync::Arc};
-
-    use crate::{cache::Cache, FileGroup};
-
-    #[test]
-    fn create_write() {
-        {
-            let cache = Arc::new(Cache::default());
-            let fg = FileGroup::new(
-                cache,
-                &[("/tmp/xoxoxo", 43)],
-                crate::Mode::ReadWrite {
-                    reserve: true,
-                    truncate: true,
-                },
-                true,
-            )
-            .unwrap();
-
-            let mut my_slices = Vec::new();
-            {
-                let mut r = unsafe { fg.borrow_mut_unchecked(0..4).unwrap() };
-                let aaa = r.get();
-                for s in aaa {
-                    s[0] = 42;
-                    my_slices.push(std::mem::replace(s, IoSliceMut::new(&mut [])));
-                }
-            }
-            //my_slices[0][1] = 43;
-        }
-    }
-}

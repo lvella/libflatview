@@ -10,7 +10,7 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, ERROR_MORE_DATA, HANDLE},
+    Foundation::{GetLastError, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED, HANDLE},
     System::{
         Ioctl::{FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES},
         SystemInformation::{GetSystemInfo, SYSTEM_INFO},
@@ -26,13 +26,29 @@ lazy_static! {
             GetSystemInfo(system_info.as_mut_ptr());
             system_info.assume_init().dwPageSize as u64
         };
-        // Assert a page is a power of two (kinda silly, I know)
+        // Assert the page size is a power of two (kinda silly, I know)
         assert!(is_power_of_two(page));
         page
     };
 }
 
 pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
+    match mimic_fallocate(file, size) {
+        Err(Error::IOError(err)) => {
+            // Wine doesn't support FSCTL_QUERY_ALLOCATED_RANGES, and Wine is
+            // the main implementation of Windows API I use, so fallback to
+            // support it:
+            if err.raw_os_error() == Some(ERROR_NOT_SUPPORTED as i32) {
+                super::foolproof_fallocate(file, size)
+            } else {
+                Err(err.into())
+            }
+        }
+        result => result,
+    }
+}
+
+fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
     const ENTRY_SIZE: u32 = std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32;
 
     // To be sure, seek the file to the beginning:
@@ -60,6 +76,15 @@ pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
                 ptr::null_mut(),
             ) != 0;
 
+            if !success {
+                let error = GetLastError();
+                if error != ERROR_MORE_DATA {
+                    println!("{error}");
+                    return Err(io::Error::from_raw_os_error(error as i32).into());
+                }
+            }
+
+            // We only use the output after we are sure
             let mut num_outputs = actual_size / ENTRY_SIZE;
             assert_eq!(actual_size % ENTRY_SIZE, 0);
 
@@ -71,11 +96,6 @@ pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
                     Length: 0,
                 });
                 num_outputs += 1;
-            } else {
-                let error = GetLastError();
-                if error != ERROR_MORE_DATA {
-                    return Err(io::Error::from_raw_os_error(error as i32).into());
-                }
             }
 
             // We got some ranges from this call, process them:
@@ -129,4 +149,12 @@ pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_mimic_fallocate() {
+        todo!()
+    }
 }

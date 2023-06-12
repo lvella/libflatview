@@ -20,6 +20,7 @@ impl From<nix::errno::Errno> for Error {
     }
 }
 
+// TODO: use libc::_SC_ADVISORY_INFO to tell if posix_fallocate is present.
 pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
     Ok(nix::fcntl::posix_fallocate(
         file.as_raw_fd(),
