@@ -99,6 +99,12 @@ impl Cache {
             }),
         }
     }
+
+    pub fn get_options(&self) -> CacheOptions {
+        // TODO: it is a little silly to have to lock the mutex here just to get
+        // the options. When refactoring to have less contention, fix this.
+        self.inner.lock().unwrap().get_options().clone()
+    }
 }
 
 #[derive(Debug)]
@@ -150,8 +156,7 @@ impl CacheImpl {
                 let mapping = &entry.insert((creator()?, 1)).0;
 
                 // Count the total mapped as a multiple of full pages.
-                let page_rounded_len = mapping.len();
-                assert!(page_rounded_len < self.options.max_mapping_size);
+                assert!(mapping.len() <= self.options.max_mapping_size);
                 self.total_mapped_size += round_to_whole_pages(mapping.len());
 
                 // Create the return value here so that we "unborrow" self, and

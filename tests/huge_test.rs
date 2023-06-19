@@ -143,10 +143,15 @@ fn write_and_read_big() {
     // Write all the files.
     let cache = Arc::new(Cache::default());
     {
-        // Split total_size in write chunks. First write is more than 5 GB long
-        // inside the same file, to test the Windows 64 bits breakup of a single
-        // mapping into multiples of IoSlices.
-        let mut writes = vec![0..(4 * GB + 10 * MB)];
+        // we can't have writes much bigger than a few times the maximum slice,
+        // otherwise we exhaust the memory address in 32 bits. Limit to 3 times
+        // the mapping size.
+        let max_write = 3 * cache.get_options().max_mapping_size as u64;
+
+        // Split total_size in write chunks. In 64 bits systems, first write is
+        // more than 4 GB long inside the same file, to test the Windows 64 bits
+        // breakup of a single mapping into multiples of IoSlices.
+        let mut writes = vec![0..min(4 * GB + 10 * MB, max_write)];
         {
             let distr = LogNormal::new(10.0, 5.0).unwrap();
             let mut written = writes.last().unwrap().end;
@@ -155,7 +160,7 @@ fn write_and_read_big() {
                 if len <= 0.0 {
                     continue;
                 }
-                let len = len as u64;
+                let len = min(len as u64, max_write);
                 let end = min(written + len, total_size);
                 writes.push(written..end);
                 written = end;

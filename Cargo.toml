@@ -11,7 +11,7 @@ linked-hash-map = "0.5"
 num-traits = "0.2"
 
 [target.'cfg(unix)'.dependencies]
-nix = "0.26"
+rustix = {version = "0.37", features = ["param"]}
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = {version = "0.48", features = [
