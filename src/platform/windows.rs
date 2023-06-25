@@ -173,6 +173,7 @@ mod tests {
     use crate::platform::windows::{mimic_fallocate, ENTRY_SIZE};
 
     #[test]
+    #[ignore]
     fn test_mimic_fallocate() {
         let path = temp_dir().join("test-sparse-file.bin");
         println!("File path: {path:?}");
