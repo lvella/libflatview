@@ -144,8 +144,8 @@ fn write_and_read_big() {
     let cache = Arc::new(Cache::default());
     {
         // we can't have writes much bigger than a few times the maximum slice,
-        // otherwise we exhaust the memory address in 32 bits. Limit to 3 times
-        // the mapping size.
+        // otherwise we exhaust the memory address in 32 bits. Limit to 3
+        // times the mapping size.
         let max_write = 3 * cache.get_options().max_mapping_size as u64;
 
         // Split total_size in write chunks. In 64 bits systems, first write is
@@ -239,13 +239,13 @@ fn write_and_read_big() {
                         let chunk = file_group
                             .borrow(chunk_start..(chunk_start + chunk_size))
                             .unwrap();
-                        let mut byte_start = 0;
+                        let mut curr_byte = 0;
                         for s in chunk.get() {
-                            let end = byte_start + s.len();
-                            assert_eq!(&s[..], &expected[byte_start..end]);
-                            byte_start = end;
+                            let end = curr_byte + s.len();
+                            assert_eq!(&s[..], &expected[curr_byte..end]);
+                            curr_byte = end;
                         }
-                        assert_eq!(byte_start as u64, chunk_size);
+                        assert_eq!(curr_byte as u64, chunk_size);
                     }
                 });
             }

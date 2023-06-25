@@ -161,11 +161,11 @@ impl CacheImpl {
 
                 // Create the return value here so that we "unborrow" self, and
                 // maybe_drop_cached() can be called.
-                let ret = Ok(mapping.as_ptr());
+                let ret = mapping.as_ptr();
 
                 self.maybe_drop_cached();
 
-                ret
+                Ok(ret)
             }
         }
     }

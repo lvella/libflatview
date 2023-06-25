@@ -265,7 +265,7 @@ impl FileGroup {
         // library it targeted) will already have the kind of control to not
         // concurrently write+write and read+write to the same place.
 
-        // Split the range in file chuncks, and the get slices from the cache.
+        // Split the range in file chunks, and the get slices from the cache.
         let (chunk_iter, mut initial_offset) = self.chunks(file_idx, offset, len);
 
         let mut slices = Vec::new();
@@ -277,6 +277,9 @@ impl FileGroup {
                     .offset(chunk.file_offset)
                     .len(chunk.mapping_len as usize);
 
+                // TODO: cache one opened file just for this call, because there
+                // are significant chances the next chunk will be on the same
+                // file, specially in 32 bits.
                 let file = OpenOptions::new()
                     .read(true)
                     .write(!self.is_read_only)
