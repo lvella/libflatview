@@ -62,17 +62,17 @@ approach, mapping the file directly offer several pros and a few cons.
    can happen are either too rare, deliberate or can be mitigated, so much that
    I still feel it is OK to not handle the errors and let the process be killed.
    They are:
- -  - File is sparse and storage is full - this can be avoided by passing `true`
+    - File is sparse and storage is full - this can be avoided by passing `true`
       to `reserve` when opening files for writing. This will allocate all the
       holes in the files before mapping, so that storage is always available. Of
       course, another process or the user might poke holes at the file while in
       use, but that has to be very deliberate to happen.
- -  - File truncated to a smaller size - if the user or another process truncates
+    - File truncated to a smaller size - if the user or another process truncates
       the file while mapped by your process, a read or write beyond the newly
       truncated size will trigger the error. Again, this has to be deliberate:
       normal file operations the user can perform, like deleting or moving the
       file won't truncate it.
- -  - There is a hardware error or failure.
+    - There is a hardware error or failure.
  - Misleading memory statistics - at least on Linux, a process that has several
    large mapped files and has recently accessed a lot of different places of
    those files, will show on `top` and other process monitoring tools as using a
@@ -82,8 +82,8 @@ approach, mapping the file directly offer several pros and a few cons.
    while in reality they are immediately available to any other process that
    needs it. It is like the `buff/cache` column displayed by the `free` command:
    on a long running system, it will be almost always occupying the whole free
-   space, while still be available on demand. In fact, a process that access a
-   lot file data in the usual way will fill the buffer cache the same way a
+   space, while still being available on demand. In fact, a process that access
+   a lot file data in the usual way will fill the buffer cache the same way a
    process using this library will fill the shared memory in use, it is just
    that is it not accounted as belonging to that process by the OS.
 
