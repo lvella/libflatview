@@ -1,5 +1,6 @@
 pub mod cache;
 mod platform;
+mod single_cache;
 
 use cache::Cache;
 use memmap2::MmapOptions;
@@ -13,6 +14,8 @@ use std::{
     ptr,
     sync::Arc,
 };
+
+use crate::single_cache::SingleCache;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -268,6 +271,11 @@ impl FileGroup {
         // Split the range in file chunks, and the get slices from the cache.
         let (chunk_iter, mut initial_offset) = self.chunks(file_idx, offset, len);
 
+        // Cache the opened file between loop iterations, because there is a
+        // considerable chance next chunk will come from the same file,
+        // specially on 32 bits.
+        let mut file_cache = SingleCache::new();
+
         let mut slices = Vec::new();
         let mut cache = self.cache.inner.lock().unwrap();
         for (loop_count, chunk) in chunk_iter.clone().enumerate() {
@@ -277,19 +285,18 @@ impl FileGroup {
                     .offset(chunk.file_offset)
                     .len(chunk.mapping_len as usize);
 
-                // TODO: cache one opened file just for this call, because there
-                // are significant chances the next chunk will be on the same
-                // file, specially in 32 bits.
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(!self.is_read_only)
-                    .create(!self.is_read_only)
-                    .open(&self.paths_and_sizes[chunk.file_idx].0)?;
+                let file = &*file_cache.get_mut(chunk.file_idx, |key| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(!self.is_read_only)
+                        .create(!self.is_read_only)
+                        .open(&self.paths_and_sizes[*key].0)
+                })?;
 
                 if self.is_read_only {
-                    options.map_raw_read_only(&file)
+                    options.map_raw_read_only(file)
                 } else {
-                    options.map_raw(&file)
+                    options.map_raw(file)
                 }
             });
 
