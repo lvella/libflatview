@@ -1,0 +1,112 @@
+name: tests
+
+on:
+  - workflow_dispatch
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+          - i686-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        target: ${{ matrix.target }}
+
+    - name: Cache rust stuff
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install multilib
+      if: ${{ contains(matrix.target, 'i686-unknown-linux-') }}
+      uses: awalsh128/cache-apt-pkgs-action@latest
+      with:
+        packages: gcc-multilib
+        version: 1.0
+
+    - name: Run tests
+      run: cargo test --all-features --target ${{ matrix.target }} --release
+
+  wine:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-pc-windows-gnu
+            apt: wine32 gcc-mingw-w64-i686 libgcc-s1:i386 libstdc++6:i386
+          - target: x86_64-pc-windows-gnu
+            apt: wine64 gcc-mingw-w64-x86-64
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        target: ${{ matrix.target }}
+
+    - name: Cache rust stuff
+      uses: Swatinem/rust-cache@v2
+
+    - name: Removing conflicting software
+      run: sudo apt-get remove liblldb-12 liblldb-13 mono-runtime
+
+    - if: ${{ matrix.target == 'i686-pc-windows-gnu' }}
+      run: sudo dpkg --add-architecture i386
+    - if: ${{ matrix.target == 'i686-pc-windows-gnu' }}
+      run: sudo apt-get update
+
+    - name: Install APT dependencies
+      run: sudo apt-get install wine-binfmt wine ${{ matrix.apt }}
+
+    - name: Run tests
+      run: cargo test --all-features --target ${{ matrix.target }} --release
+
+  windows_tests:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-pc-windows-gnu
+          - i686-pc-windows-msvc
+          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable-${{ matrix.target }}
+
+    - name: Cache rust stuff
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run tests
+      run: cargo test --all-features --target ${{ matrix.target }} --release -- --include-ignored
+
+  macos_tests:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache rust stuff
+      uses: Swatinem/rust-cache@v2
+
+    - name: Run tests
+      run: cargo test --all-features --release

@@ -4,7 +4,7 @@ use std::{
     cmp::min,
     ffi::c_void,
     fs::File,
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::windows::prelude::AsRawHandle,
     ptr,
