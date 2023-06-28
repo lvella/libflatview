@@ -41,13 +41,40 @@ pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
             // the main implementation of Windows API I use, so fallback to
             // support it:
             if err.raw_os_error() == Some(ERROR_NOT_SUPPORTED as i32) {
-                super::foolproof_fallocate(file, size)
+                foolproof_fallocate(file, size)
             } else {
                 Err(err.into())
             }
         }
         result => result,
     }
+}
+
+fn foolproof_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
+    if file.metadata()?.len() < size {
+        file.set_len(size)?;
+    }
+
+    let mut buffer = [0; 8 * 1024];
+
+    let mut pos = file.seek(SeekFrom::Start(0))?;
+    while pos < size {
+        let count = min(buffer.len() as u64, size - pos) as usize;
+        let buffer = &mut buffer[..count];
+
+        // Read a chunk of the file.
+        let count = file.read(buffer)?;
+        if count == 0 {
+            break;
+        }
+
+        // Write it back to the same place.
+        file.seek(SeekFrom::Start(pos))?;
+        file.write_all(buffer)?;
+
+        pos += count as u64;
+    }
+    Ok(())
 }
 
 fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
