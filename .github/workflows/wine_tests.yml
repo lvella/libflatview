@@ -27,17 +27,16 @@ jobs:
     - name: Cache rust stuff
       uses: Swatinem/rust-cache@v2
 
-    - run: sudo apt-get remove liblldb-12 liblldb-13 mono-runtime
+    - name: Removing conflicting software
+      run: sudo apt-get remove liblldb-12 liblldb-13 mono-runtime
+
     - if: ${{ matrix.target == 'i686-pc-windows-gnu' }}
       run: sudo dpkg --add-architecture i386
     - if: ${{ matrix.target == 'i686-pc-windows-gnu' }}
       run: sudo apt-get update
 
     - name: Install APT dependencies
-      uses: awalsh128/cache-apt-pkgs-action@latest
-      with:
-        packages: wine-binfmt wine ${{ matrix.apt }}
-        version: 1.0
+      run: sudo apt-get install wine-binfmt wine ${{ matrix.apt }}
 
     - name: Run tests
       run: cargo test --all-features --target ${{ matrix.target }} --release
