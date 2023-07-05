@@ -354,7 +354,22 @@ impl FileGroup {
     }
 
     /// Borrows a read-only reference to a range.
+    ///
+    /// Currently this function is only implemented for read-only FileGroup.
     pub fn borrow(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
+        if !self.is_read_only {
+            unimplemented!();
+        }
+        // SAFETY: This is safe because self is a read-only FileGroup.
+        unsafe { self.borrow_unchecked(range) }
+    }
+
+    /// Unsafely borrows a read-only reference to a range.
+    ///
+    /// This is unsafe because the caller must ensure there is no writer to this
+    /// same range across all threads, so that the returned range does not
+    /// violates rust's aliasing rules.
+    pub unsafe fn borrow_unchecked(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
         let (start, end) = self.unpack_range(range);
         let (releaser, slices) = self.raw_get(start, end)?;
         Ok(Ref {
@@ -363,7 +378,7 @@ impl FileGroup {
         })
     }
 
-    /// Borrows a read-write reference to a range.
+    /// Unsafely borrows a read-write reference to a range.
     ///
     /// This is unsafe because the caller must ensure there is no other reader
     /// or writer to this same range across all threads, so that the returned
