@@ -11,16 +11,16 @@ linked-hash-map = "0.5"
 num-traits = "0.2"
 
 [target.'cfg(unix)'.dependencies]
-rustix = {version = "0.37", features = ["param"]}
+rustix = { version = "0.37", features = ["param"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = {version = "0.48", features = [
+windows-sys = { version = "0.48", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_Foundation",
-    "Win32_System_Ioctl"
-]}
+    "Win32_System_Ioctl",
+] }
 
 [dev-dependencies]
 tempfile = "3"

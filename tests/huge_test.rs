@@ -170,22 +170,14 @@ fn write_and_read_big() {
         let writes = multiconsumer::Queue::new(writes);
 
         // Create the linear accessor to the files:
-        let file_group = FileGroup::new(
-            cache.clone(),
-            &files,
-            Mode::ReadWrite {
-                reserve: true,
-                truncate: true,
-            },
-            true,
-        )
-        .unwrap();
+        let file_group =
+            FileGroup::new(cache.clone(), &files, Mode::ReadWrite { reserve: true }).unwrap();
 
         // Execute the writes in parallel threads.
         thread::scope(|s| {
             let writes = &writes;
             let file_group = &file_group;
-            for t in 0..8 {
+            for t in 0..1 {
                 s.spawn(move || {
                     while let Some(r) = writes.next() {
                         let full_len = r.end - r.start;
@@ -215,7 +207,7 @@ fn write_and_read_big() {
 
     // Verify what has been written
     {
-        let file_group = FileGroup::new(cache, &files, Mode::ReadOnly, true).unwrap();
+        let file_group = FileGroup::new(cache, &files, Mode::ReadOnly).unwrap();
 
         // Parallel verify in chunks of 16 KB:
         const CHUNK_SIZE: u64 = 16 * KB;

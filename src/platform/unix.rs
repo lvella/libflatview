@@ -20,12 +20,11 @@ impl From<rustix::io::Errno> for Error {
     }
 }
 
-// TODO: use libc::_SC_ADVISORY_INFO to tell if posix_fallocate is present.
-pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
+pub fn preallocate_file(file: &mut File, offset: u64, len: u64) -> Result<(), Error> {
     Ok(rustix::fs::fallocate(
         file,
         rustix::fs::FallocateFlags::empty(),
-        0,
-        size,
+        offset,
+        len,
     )?)
 }

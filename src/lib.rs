@@ -1,4 +1,5 @@
 pub mod cache;
+mod path_resolver;
 mod platform;
 mod single_cache;
 
@@ -6,8 +7,9 @@ use cache::Cache;
 use memmap2::MmapOptions;
 use platform::preallocate_file;
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, ErrorKind, IoSlice, IoSliceMut},
+    cmp::min,
+    fs::{create_dir_all, OpenOptions},
+    io::{ErrorKind, IoSlice, IoSliceMut},
     iter::FusedIterator,
     ops::RangeBounds,
     path::{Path, PathBuf},
@@ -21,58 +23,51 @@ use crate::single_cache::SingleCache;
 pub enum Error {
     #[error("system error when accessing a file")]
     IOError(#[from] std::io::Error),
-    #[error("file have unexpected size")]
-    WrongSize,
-    #[error("not a regular file")]
-    NotAFile,
-    #[error("path component is not a directory")]
-    NotADirectory,
+    #[error("file path provided is empty")]
+    EmptyPath,
     #[error("a write was attempted on read-only mode")]
     ReadOnlyMode,
     #[error("the range requested is invalid")]
     InvalidRange,
+    #[error("file is smaller than expected size")]
+    FileTooSmall,
 }
 
 /// The operation mode of a `FileGroup`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Files are opened and mapped as read-only. If they don't exist or are
-    /// smaller than expected, error `Error::WrongSize` is returned.
+    /// Files are opened and mapped as read-only.
     ReadOnly,
-    /// Files are opened and mapped in read and write mode. If they don't exist
-    /// or are smaller than expected, they are created and extended to the
-    /// expected size.
+    /// Files are opened and mapped in read and write mode.
     ///
     /// If `reserve` is set, all non-allocated blocks on sparse files will be
-    /// allocated upon the creation of the `FileGroup`. This is recommended,
+    /// allocated before a mapping is returned to the user. This is recommended,
     /// because if the application tries to write to an unallocated block, but
     /// it can't be allocated because the storage is full, your application will
-    /// be signaled with SIGBUS on POSIX, and God knows what happens on Windows.
-    ///
-    /// If `truncate` is set, files larger than what they are supposed to be are
-    /// truncated.
-    ReadWrite { reserve: bool, truncate: bool },
+    /// be signaled with SIGBUS on POSIX and with Structured Error Handling on
+    /// Windows.
+    ReadWrite { reserve: bool },
 }
 
 /// A sequence of files with known sizes grouped together as a single 64-bit
 /// addressable byte array.
 ///
 /// Maybe this should go without saying, but in write mode, the object assumes
-/// it is the sole writer of the file. This obvious, of course, as you always
+/// it is the sole writer of the file. This is obvious, of course, as you always
 /// have a race condition when two threads/processes writes to the same file
 /// without synchronization between them.
 #[derive(Debug)]
 pub struct FileGroup {
     /// Cache shared among other `FileGroup` storing actual file mappings. It
     /// has to be shared if we want to control the amount of resources used
-    /// globally by the all the file groups sharing it.
+    /// across all the file groups sharing it.
     cache: Arc<Cache>,
 
     /// Unique identifier inside the cache.
     unique_id: u64,
 
-    /// Tells if this is in read-only mode.
-    is_read_only: bool,
+    /// Tells if this is in read-write or read-only mode.
+    operation_mode: Mode,
 
     /// The path and size of of every file whose requested size was greater than
     /// zero.
@@ -93,101 +88,65 @@ pub struct FileGroup {
 impl FileGroup {
     /// Creates a new `FileGroup` from a group of file names.
     ///
-    /// Relative paths and symbolic links are resolved at the moment of this
-    /// call.
-    ///  
-    /// If `strict_size` is set, error `Error::WrongSize` is raised if there are
-    /// files larger than the expected.
+    /// Existing directories will be traversed at the moment of this call, so
+    /// that relative paths and symbolic links are resolved immediately.
+    /// Changing working directory at a later time will not affect an existing
+    /// `FileGroup`.
     ///
-    /// For the other behaviors you can configure, see `Mode` struct.
+    /// It is OK to create a `FileGroup` when only some of the files exists or
+    /// have sizes smaller than informed. When mutably borrowing (available in
+    /// read-write mode), directories and files will be created or extended as
+    /// needed. When borrowing non-mutably, an Error is returned if part of the
+    /// range is not available.
+    ///
+    /// See `Mode` struct for more options.
     pub fn new(
         shared_cache: Arc<Cache>,
         files_with_sizes: &[(impl AsRef<Path>, u64)],
         operation_mode: Mode,
-        strict_size: bool,
     ) -> Result<FileGroup, Error> {
-        let is_read_only = if let Mode::ReadOnly = &operation_mode {
-            true
-        } else {
-            false
-        };
-
-        // Sanity check every path without modifying the filesystem, to
-        // trigger an error in cases we can before writing anything.
-        for (path, required_size) in files_with_sizes {
-            let path = path.as_ref();
-            // We actually try to open the file instead of just retrieving
-            // metadata, because in unixes it seems this is the only reliable
-            // way to know if a file is writable.
-            let open_result = OpenOptions::new()
-                .read(true)
-                .write(!is_read_only)
-                .open(path);
-
-            match open_result {
-                Ok(file) => {
-                    let metadata = file.metadata()?;
-                    if !metadata.is_file() {
-                        return Err(Error::NotAFile);
-                    }
-                    if (strict_size && metadata.len() > *required_size)
-                        || (is_read_only && metadata.len() < *required_size)
-                    {
-                        return Err(Error::WrongSize);
-                    }
-                }
-                Err(err) => {
-                    if is_read_only || err.kind() != ErrorKind::NotFound {
-                        return Err(err.into());
-                    }
-
-                    has_writable_first_existing_ancestor(path.parent().ok_or(err)?)?;
-                }
-            }
-        }
-
-        // Create and truncate every file if in writing mode. In read only mode
-        // all files have already been checked, and we are all good.
-        if let Mode::ReadWrite { reserve, truncate } = operation_mode {
-            for (path, required_size) in files_with_sizes {
-                let path = path.as_ref();
-                if let Some(dir) = path.parent() {
-                    fs::create_dir_all(dir)?;
-                }
-
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .open(path)?;
-
-                let metadata = file.metadata()?;
-
-                if (metadata.len() < *required_size)
-                    || (truncate && metadata.len() > *required_size)
-                {
-                    file.set_len(*required_size)?;
-                }
-
-                if reserve {
-                    preallocate_file(&mut file, *required_size)?;
-                }
-            }
-        }
-
         // Remove zero sized files, because they are never mapped and only
         // complicates stuff, and canonicalize all paths so they are independent
         // of current workdir.
-        let paths_and_sizes = files_with_sizes
+        //let mut existing_paths = HashSet::new();
+        let files_with_sizes = files_with_sizes
             .iter()
             .filter_map(|(path, size)| {
-                if *size == 0 {
-                    None
+                if *size != 0 {
+                    Some((path.as_ref(), *size))
                 } else {
-                    Some(fs::canonicalize(path).map(|path| (path, *size)))
+                    None
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
+
+        Self::new_impl(shared_cache, files_with_sizes, operation_mode)
+    }
+
+    fn new_impl(
+        shared_cache: Arc<Cache>,
+        files_with_sizes: Vec<(&Path, u64)>,
+        operation_mode: Mode,
+    ) -> Result<FileGroup, Error> {
+        // We assume every existing file to be fully allocated. If reserve is
+        // set, we must ensure this is true for existing files.
+        if let Mode::ReadWrite { reserve: true } = &operation_mode {
+            for (path, required_size) in files_with_sizes.iter() {
+                if let Ok(mut file) = OpenOptions::new().read(true).write(true).open(path) {
+                    let metadata = file.metadata()?;
+                    preallocate_file(&mut file, 0, min(metadata.len(), *required_size))?;
+                }
+            }
+        }
+
+        // Resolve paths as best as possible:
+        let resolved_paths =
+            path_resolver::resolve_known_paths(files_with_sizes.iter().map(|(path, _)| *path))?;
+        assert_eq!(resolved_paths.len(), files_with_sizes.len());
+        let paths_and_sizes = resolved_paths
+            .into_iter()
+            .zip(files_with_sizes.into_iter().map(|(_, size)| size))
+            .collect::<Vec<_>>();
 
         // Calculate matching vector of cumulative sizes.
         let mut total_size = 0u64;
@@ -209,7 +168,7 @@ impl FileGroup {
         Ok(FileGroup {
             unique_id,
             cache: shared_cache,
-            is_read_only,
+            operation_mode,
             paths_and_sizes,
             cumulative_sizes,
             total_size,
@@ -236,6 +195,7 @@ impl FileGroup {
         &self,
         start: u64,
         end: u64,
+        can_write: bool,
     ) -> Result<(ChunksReleaser, Vec<S>), Error> {
         // Sanitize range bounds:
         if start > end || end > self.total_size {
@@ -275,6 +235,7 @@ impl FileGroup {
         // considerable chance next chunk will come from the same file,
         // specially on 32 bits.
         let mut file_cache = SingleCache::new();
+        let mut len_cache = SingleCache::new();
 
         let mut slices = Vec::new();
         let mut cache = self.cache.inner.lock().unwrap();
@@ -285,18 +246,57 @@ impl FileGroup {
                     .offset(chunk.file_offset)
                     .len(chunk.mapping_len as usize);
 
-                let file = &*file_cache.get_mut(chunk.file_idx, |key| {
-                    OpenOptions::new()
-                        .read(true)
-                        .write(!self.is_read_only)
-                        .create(!self.is_read_only)
-                        .open(&self.paths_and_sizes[*key].0)
+                let file = file_cache.get_mut(chunk.file_idx, |key| {
+                    let path = &self.paths_and_sizes[*key].0;
+
+                    let mut open_options = OpenOptions::new();
+                    open_options.read(true).write(can_write).create(can_write);
+
+                    // First attempt at opening the file.
+                    let result = open_options.open(path);
+
+                    // If file was not found, but we can write and there is a
+                    // valid parent path, we try again, this time trying to
+                    // create the possibly missing path to the file. (All this
+                    // could be written in a single match line, but I don't like
+                    // calling path.parent() if not strictly necessary.)
+                    if let Err(err) = &result {
+                        if can_write && err.kind() == ErrorKind::NotFound {
+                            if let Some(parent_dir) = path.parent() {
+                                create_dir_all(parent_dir)?;
+                                return open_options.open(path);
+                            }
+                        }
+                    }
+
+                    result
                 })?;
 
-                if self.is_read_only {
-                    options.map_raw_read_only(file)
+                let file_len =
+                    *len_cache.get_mut(chunk.file_idx, |_| file.metadata().map(|m| m.len()))?;
+
+                let min_expected_file_len = chunk.file_offset + chunk.mapping_len as u64;
+
+                if file_len < min_expected_file_len {
+                    if can_write {
+                        file.set_len(min_expected_file_len)?;
+                        platform::preallocate_file(
+                            file,
+                            file_len,
+                            min_expected_file_len - file_len,
+                        )?;
+
+                        // Invalidate len cache because file size changed.
+                        len_cache = SingleCache::new();
+                    } else {
+                        return Err(Error::FileTooSmall);
+                    }
+                }
+
+                if can_write {
+                    Ok(options.map_raw(&*file)?)
                 } else {
-                    options.map_raw(file)
+                    Ok(options.map_raw_read_only(&*file)?)
                 }
             });
 
@@ -357,21 +357,32 @@ impl FileGroup {
     ///
     /// Currently this function is only implemented for read-only FileGroup.
     pub fn borrow(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
-        if !self.is_read_only {
+        if !self.is_read_only() {
             unimplemented!();
         }
         // SAFETY: This is safe because self is a read-only FileGroup.
         unsafe { self.borrow_unchecked(range) }
     }
 
+    /// Borrows a read-write reference to a range.
+    ///
+    /// Currently safe function is not implemented.
+    pub fn borrow_mut(&self, _range: impl RangeBounds<u64>) -> Result<RefMut, Error> {
+        unimplemented!();
+    }
+
     /// Unsafely borrows a read-only reference to a range.
+    ///
+    /// If some files does not exits or is smaller than expected, it is created
+    /// and extended to the needed size. If `reserve` was specified when
+    /// creating the FileGroup, any file extension will be allocated on disk.
     ///
     /// This is unsafe because the caller must ensure there is no writer to this
     /// same range across all threads, so that the returned range does not
     /// violates rust's aliasing rules.
     pub unsafe fn borrow_unchecked(&self, range: impl RangeBounds<u64>) -> Result<Ref, Error> {
         let (start, end) = self.unpack_range(range);
-        let (releaser, slices) = self.raw_get(start, end)?;
+        let (releaser, slices) = self.raw_get(start, end, false)?;
         Ok(Ref {
             _releaser: releaser,
             slices,
@@ -387,11 +398,11 @@ impl FileGroup {
         &self,
         range: impl RangeBounds<u64>,
     ) -> Result<RefMut, Error> {
-        if self.is_read_only {
+        if self.is_read_only() {
             return Err(Error::ReadOnlyMode);
         }
         let (start, end) = self.unpack_range(range);
-        let (releaser, slices) = self.raw_get(start, end)?;
+        let (releaser, slices) = self.raw_get(start, end, true)?;
         Ok(RefMut {
             _releaser: releaser,
             slices,
@@ -415,6 +426,10 @@ impl FileGroup {
             },
             initial_chunk_offset,
         )
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        Mode::ReadOnly == self.operation_mode
     }
 }
 
@@ -582,47 +597,6 @@ impl<'a, 's> RefMut<'a, 's> {
     pub fn get(&'s mut self) -> &'s mut [IoSliceMut<'s>] {
         &mut self.slices
     }
-}
-
-/// Try its best to decide if the first existing ancestor of a path is a
-/// writable directory.
-///
-/// Returns error if an existing part of the path is not a directory, if the
-/// last existing directory is not writable.
-fn has_writable_first_existing_ancestor(path: &Path) -> Result<(), Error> {
-    let mut last_err: io::Error = ErrorKind::NotFound.into();
-    for ancestor in path.ancestors() {
-        let ancestor = if !ancestor.as_os_str().is_empty() {
-            ancestor
-        } else {
-            &Path::new(".")
-        };
-
-        match fs::metadata(ancestor) {
-            Ok(metadata) => {
-                // First existing path section found. Fail if is a dir or not
-                // writable, otherwise succeed.
-                return if !metadata.is_dir() {
-                    Err(Error::NotADirectory)
-                } else if metadata.permissions().readonly() {
-                    // TODO: try to test for permissions more reliably, possibly
-                    // using platform specific calls.
-                    Err(Error::IOError(ErrorKind::PermissionDenied.into()))
-                } else {
-                    Ok(())
-                };
-            }
-            Err(err) => {
-                if err.kind() != ErrorKind::NotFound {
-                    return Err(err.into());
-                }
-                last_err = err;
-            }
-        }
-    }
-
-    // Could not find any directory in the path (how is that possible???).
-    Err(Error::IOError(last_err))
 }
 
 fn is_power_of_two<T: num_traits::Unsigned + std::ops::BitAnd<Output = T> + Copy>(val: T) -> bool {

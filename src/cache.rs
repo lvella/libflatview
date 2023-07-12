@@ -1,9 +1,9 @@
-use std::{collections::HashMap, io, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 
 use linked_hash_map::LinkedHashMap;
 use memmap2::MmapRaw;
 
-use crate::{is_power_of_two, platform::PAGESIZE};
+use crate::{is_power_of_two, platform::PAGESIZE, Error};
 
 /// Resources limit options for a `Cache`.
 ///
@@ -139,8 +139,8 @@ impl CacheImpl {
         &mut self,
         group_id: u64,
         offset: u64,
-        creator: impl FnOnce() -> io::Result<MmapRaw>,
-    ) -> io::Result<*const u8> {
+        creator: impl FnOnce() -> Result<MmapRaw, Error>,
+    ) -> Result<*const u8, Error> {
         match self.cache.entry((group_id, offset)) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 // Remove entry from the LRU fifo, because it is now in use and

@@ -34,14 +34,14 @@ lazy_static! {
     };
 }
 
-pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
-    match mimic_fallocate(file, size) {
+pub fn preallocate_file(file: &mut File, offset: u64, len: u64) -> Result<(), Error> {
+    match mimic_fallocate(file, offset, len) {
         Err(Error::IOError(err)) => {
             // Wine doesn't support FSCTL_QUERY_ALLOCATED_RANGES, and Wine is
             // the main implementation of Windows API I use, so fallback to
             // support it:
             if err.raw_os_error() == Some(ERROR_NOT_SUPPORTED as i32) {
-                foolproof_fallocate(file, size)
+                foolproof_fallocate(file, offset, len)
             } else {
                 Err(err.into())
             }
@@ -50,16 +50,16 @@ pub fn preallocate_file(file: &mut File, size: u64) -> Result<(), Error> {
     }
 }
 
-fn foolproof_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
-    if file.metadata()?.len() < size {
-        file.set_len(size)?;
+fn foolproof_fallocate(file: &mut File, offset: u64, len: u64) -> Result<(), Error> {
+    if file.metadata()?.len() < len {
+        file.set_len(len)?;
     }
 
     let mut buffer = [0; 8 * 1024];
 
-    let mut pos = file.seek(SeekFrom::Start(0))?;
-    while pos < size {
-        let count = min(buffer.len() as u64, size - pos) as usize;
+    let mut pos = file.seek(SeekFrom::Start(offset))?;
+    while pos < len {
+        let count = min(buffer.len() as u64, len - pos) as usize;
         let buffer = &mut buffer[..count];
 
         // Read a chunk of the file.
@@ -77,20 +77,22 @@ fn foolproof_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
-    // To be sure, seek the file to the beginning:
-    let mut file_pos = file.seek(io::SeekFrom::Start(0))?;
+fn mimic_fallocate(file: &mut File, offset: u64, len: u64) -> Result<(), Error> {
+    let end = offset + len;
+
+    // Seek the file to the offset:
+    let mut file_pos = file.seek(io::SeekFrom::Start(offset))?;
 
     let mut default_value = None;
     let mut query_range = [FILE_ALLOCATED_RANGE_BUFFER {
-        FileOffset: 0,
-        Length: size as i64,
+        FileOffset: offset as i64,
+        Length: len as i64,
     }];
     unsafe {
         loop {
             let mut allocated_slices = [MaybeUninit::<FILE_ALLOCATED_RANGE_BUFFER>::uninit(); 512];
             let mut actual_size = 0u32;
-            let success = DeviceIoControl(
+            let finished = DeviceIoControl(
                 file.as_raw_handle() as HANDLE,
                 FSCTL_QUERY_ALLOCATED_RANGES,
                 query_range.as_ptr() as *const c_void,
@@ -103,23 +105,22 @@ fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
                 ptr::null_mut(),
             ) != 0;
 
-            if !success {
+            if !finished {
                 let error = GetLastError();
                 if error != ERROR_MORE_DATA {
-                    println!("{error}");
                     return Err(io::Error::from_raw_os_error(error as i32).into());
                 }
             }
 
-            // We only use the output after we are sure
+            // We only use the output after we are sure there was no error.
             let mut num_outputs = actual_size / ENTRY_SIZE;
             assert_eq!(actual_size % ENTRY_SIZE, 0);
 
-            if success {
+            if finished {
                 // Add one extra dummy slice to the end so the loop will fill
                 // the space up to there.
                 allocated_slices[num_outputs as usize].write(FILE_ALLOCATED_RANGE_BUFFER {
-                    FileOffset: size as i64,
+                    FileOffset: end as i64,
                     Length: 0,
                 });
                 num_outputs += 1;
@@ -129,7 +130,7 @@ fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
             let allocated_slices = &allocated_slices[..num_outputs as usize];
             for e in allocated_slices.into_iter().map(|e| e.assume_init_ref()) {
                 assert!(file_pos <= e.FileOffset as u64);
-                assert!((e.FileOffset + e.Length) as u64 <= size);
+                assert!((e.FileOffset + e.Length) as u64 <= end);
                 if file_pos < e.FileOffset as u64 {
                     // Everything from file_pos to the first allocated range
                     // should be sparse.
@@ -162,14 +163,14 @@ fn mimic_fallocate(file: &mut File, size: u64) -> Result<(), Error> {
                 file_pos = file.seek(io::SeekFrom::Start(file_pos + e.Length as u64))?;
             }
 
-            if success {
-                assert_eq!(file_pos, size);
+            if finished {
+                assert_eq!(file_pos, end);
                 break;
             } else {
-                assert!(file_pos < size);
-                // We have more data to process, skip the range we already processed:
+                assert!(file_pos < end);
+                // We have more data to process, start after the range we already processed:
                 query_range[0] = FILE_ALLOCATED_RANGE_BUFFER {
-                    Length: (size - file_pos) as i64,
+                    Length: (end - file_pos) as i64,
                     FileOffset: file_pos as i64,
                 };
             }
@@ -269,12 +270,12 @@ mod tests {
             }
         }
 
-        // Fully allocate space for the file:
-        mimic_fallocate(&mut file, size).unwrap();
+        // Allocate space for the second half of the file:
+        mimic_fallocate(&mut file, size / 2, size).unwrap();
 
         // Ensure the file's allocated chunks cover the entire size:
         unsafe {
-            let mut cursor = 0u64;
+            let mut cursor = size / 2;
             while cursor < size {
                 let query_range = FILE_ALLOCATED_RANGE_BUFFER {
                     FileOffset: cursor as i64,
