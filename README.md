@@ -1,7 +1,7 @@
 This library provides a way to see a group of files as a single addressable byte
-array. The files are directly mapped into memory to avoid buffer copies and faster
-network send/receive, when leaving data cache management to the OS. The mappings
-themselves are cached to prevent frequent system calls.
+array. The files are directly mapped into memory to avoid buffer copies and
+faster network send/receive, while leaving data cache management to the OS. The
+mappings themselves are cached to prevent frequent system calls.
 
 It was specifically designed for BitTorrent V1 applications, where all the files
 in a torrent are seen as a big byte array for hashing and addressing purposes.
@@ -66,12 +66,13 @@ approach, mapping the file directly offer several pros and a few cons.
       to `reserve` when opening files for writing. This will allocate all the
       holes in the files before mapping, so that storage is always available. Of
       course, another process or the user might poke holes at the file while in
-      use, but that has to be very deliberate to happen.
-    - File truncated to a smaller size - if the user or another process truncates
-      the file while mapped by your process, a read or write beyond the newly
-      truncated size will trigger the error. Again, this has to be deliberate:
-      normal file operations the user can perform, like deleting or moving the
-      file won't truncate it.
+      use, and simultaneously fill up all the available space, but that has to
+      be very deliberate to happen.
+    - File is truncated to a smaller size - if the user or another process
+      truncates the file while mapped by your process, a read or write beyond
+      the newly truncated size will trigger the error. Again, this has to be
+      deliberate: normal file operations the user can perform, like deleting or
+      moving the file won't truncate it.
     - There is a hardware error or failure.
  - Misleading memory statistics - at least on Linux, a process that has several
    large mapped files and has recently accessed a lot of different places of
@@ -81,11 +82,11 @@ approach, mapping the file directly offer several pros and a few cons.
    the user might think that the process is holding all those system resources,
    while in reality they are immediately available to any other process that
    needs it. It is like the `buff/cache` column displayed by the `free` command:
-   on a long running system, it will be almost always occupying the whole free
-   space, while still being available on demand. In fact, a process that access
-   a lot file data in the usual way will fill the buffer cache the same way a
-   process using this library will fill the shared memory in use, it is just
-   that is it not accounted as belonging to that process by the OS.
+   on a long running system, it will be almost always be occupying the whole
+   free space, while still being available on demand. In fact, a process that
+   accesses a lot file data in the usual way will fill the buffer cache the same
+   way a process using this library will fill the shared memory in use, it is
+   just that is it not accounted as belonging to that process by the OS.
 
 ## Alternatives
 
