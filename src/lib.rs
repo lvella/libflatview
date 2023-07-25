@@ -373,10 +373,6 @@ impl FileGroup {
 
     /// Unsafely borrows a read-only reference to a range.
     ///
-    /// If some files does not exits or is smaller than expected, it is created
-    /// and extended to the needed size. If `reserve` was specified when
-    /// creating the FileGroup, any file extension will be allocated on disk.
-    ///
     /// This is unsafe because the caller must ensure there is no writer to this
     /// same range across all threads, so that the returned range does not
     /// violates rust's aliasing rules.
@@ -390,6 +386,10 @@ impl FileGroup {
     }
 
     /// Unsafely borrows a read-write reference to a range.
+    ///
+    /// If some files does not exits or is smaller than expected, it is created
+    /// and extended to the needed size. If `reserve` was specified when
+    /// creating the FileGroup, any file extension will be allocated on disk.
     ///
     /// This is unsafe because the caller must ensure there is no other reader
     /// or writer to this same range across all threads, so that the returned
