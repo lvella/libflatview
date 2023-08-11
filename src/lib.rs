@@ -280,11 +280,13 @@ impl FileGroup {
                 if file_len < min_expected_file_len {
                     if can_write {
                         file.set_len(min_expected_file_len)?;
-                        platform::preallocate_file(
-                            file,
-                            file_len,
-                            min_expected_file_len - file_len,
-                        )?;
+                        if let Mode::ReadWrite { reserve: true } = self.operation_mode {
+                            platform::preallocate_file(
+                                file,
+                                file_len,
+                                min_expected_file_len - file_len,
+                            )?;
+                        }
 
                         // Invalidate len cache because file size changed.
                         len_cache = SingleCache::new();
