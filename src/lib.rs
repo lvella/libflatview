@@ -233,7 +233,7 @@ impl FileGroup {
 
         // Cache the opened file between loop iterations, because there is a
         // considerable chance next chunk will come from the same file,
-        // specially on 32 bits.
+        // specially on 32 bits systems.
         let mut file_cache = SingleCache::new();
         let mut len_cache = SingleCache::new();
 
@@ -387,8 +387,8 @@ impl FileGroup {
 
     /// Unsafely borrows a read-write reference to a range.
     ///
-    /// If some files does not exits or is smaller than expected, it is created
-    /// and extended to the needed size. If `reserve` was specified when
+    /// If some files does not exits or are smaller than expected, they are
+    /// created and extended to the needed size. If `reserve` was specified when
     /// creating the FileGroup, any file extension will be allocated on disk.
     ///
     /// This is unsafe because the caller must ensure there is no other reader
@@ -478,12 +478,18 @@ struct ChunkIter<'a> {
     remaining_bytes: u64,
 }
 
+/// Fully determines one whole chunk of a mapped file.
 #[derive(Debug, Clone)]
 struct Chunk {
+    /// The index of the file this chunk belongs to.
     file_idx: usize,
+    /// The offset of this chunk inside the file.
     file_offset: u64,
+    /// The offset of this chunk inside the whole group.
     group_offset: u64,
+    /// The actual size of the mapping.
     mapping_len: usize,
+    /// The size the user requested.
     user_len: usize,
 }
 
@@ -550,7 +556,7 @@ impl<'a> Drop for ChunksReleaser<'a> {
 /// `&'s self` by the accessor functions.
 ///
 /// Deref should NOT be implemented for this type! It could cause dangling
-/// references and all kind of memory hazards!
+/// references and all kinds of memory hazards!
 ///
 /// The reason is that Deref expects the referenced object to be able to outlive
 /// `Self` (i.e., `obj.deref().to_owned()` should live independently of `obj`).

@@ -28,9 +28,9 @@ approach, mapping the file directly offer several pros and a few cons.
    resource. Using this library, file descriptors are only open for a shot time
    when the file is being mapped. File mappings are a per process resource that
    doesn't interfere with the rest of the system.
- - IO transparently becomes asynchronous - I think this is huge for file ⇔
-   network applications. File reads and writes via common system calls are
-   synchronous. There are asynchronous APIs, but unless you are a database
+ - IO transparently becomes asynchronous - I think this is a huge benefit for
+   file ⇔ network applications. File reads and writes via common system calls
+   are synchronous. There are asynchronous APIs, but unless you are a database
    software engineer, you probably never used them. Hardly any of the commonly
    used asynchronous frameworks exposes asynchronous file IO consistently
    (`libuv` can only do asynchronous file IO under Linux if `io_uring` is
@@ -61,13 +61,13 @@ approach, mapping the file directly offer several pros and a few cons.
    specially if you are not using C or C++. That said, the situations this error
    can happen are either too rare, deliberate or can be mitigated, so much that
    I still feel it is OK to not handle the errors and let the process be killed.
-   They are:
+   Those situations are:
     - File is sparse and storage is full - this can be avoided by passing `true`
       to `reserve` when opening files for writing. This will allocate all the
       holes in the files before mapping, so that storage is always available. Of
       course, another process or the user might poke holes at the file while in
-      use, and simultaneously fill up all the available space, but that has to
-      be very deliberate to happen.
+      use, while simultaneously filling up all the available space, but that has
+      to be very deliberate to happen.
     - File is truncated to a smaller size - if the user or another process
       truncates the file while mapped by your process, a read or write beyond
       the newly truncated size will trigger the error. Again, this has to be
